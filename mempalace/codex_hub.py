@@ -81,7 +81,9 @@ def hub_is_healthy(base_url: str, headers: dict) -> bool:
         return False
 
 
-def _call(base_url: str, headers: dict, sessions_root: str, max_turns: int) -> dict:
+def _call(
+    base_url: str, headers: dict, sessions_root: str, max_turns: int, backfill: bool = False
+) -> dict:
     body = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -89,7 +91,11 @@ def _call(base_url: str, headers: dict, sessions_root: str, max_turns: int) -> d
             "method": "tools/call",
             "params": {
                 "name": "mempalace_codex_capture",
-                "arguments": {"sessions_root": sessions_root, "max_turns": max_turns},
+                "arguments": {
+                    "sessions_root": sessions_root,
+                    "max_turns": max_turns,
+                    "backfill": backfill,
+                },
             },
         }
     ).encode("utf-8")
@@ -122,7 +128,7 @@ def _call(base_url: str, headers: dict, sessions_root: str, max_turns: int) -> d
     raise HubRefused("hub response carried no capture result")
 
 
-def capture_via_hub(palace_path: str, sessions_root: str) -> dict:
+def capture_via_hub(palace_path: str, sessions_root: str, *, backfill: bool = False) -> dict:
     """Run a full capture pass through the hub. Raises HubUnavailable/HubRefused."""
     target = hub_target(palace_path)
     if target is None:
@@ -142,7 +148,7 @@ def capture_via_hub(palace_path: str, sessions_root: str) -> dict:
         "hub_url": base_url,
     }
     for _ in range(MAX_CALLS_PER_PASS):
-        stats = _call(base_url, headers, sessions_root, TURNS_PER_CALL)
+        stats = _call(base_url, headers, sessions_root, TURNS_PER_CALL, backfill)
         if not stats.get("success", True):
             raise HubRefused(str(stats.get("error") or "hub capture failed"))
         totals["hub_calls"] += 1

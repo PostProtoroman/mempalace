@@ -35,7 +35,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .sources.codex import ADAPTER_VERSION, iter_rollouts, iter_turns, turn_to_drawer
+from .sources.codex import (
+    ADAPTER_VERSION,
+    classify_rollout,
+    iter_rollouts,
+    iter_turns,
+    turn_to_drawer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,132 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def activation_path(palace_path: str) -> Path:
+    return state_dir(palace_path) / "activation.json"
+
+
+def read_activation(palace_path: str) -> Optional[dict]:
+    try:
+        return json.loads(activation_path(palace_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_activation(palace_path: str, sessions_root: str) -> dict:
+    """Record the activation point, once.
+
+    Capture starts from *now*, not from the beginning of history. Installing
+    the service on a machine with years of Codex sessions must not quietly
+    import all of them — that is a large, surprising write the user never
+    asked for, and it is the kind of thing that should be a decision rather
+    than a side effect of turning capture on.
+
+    The baseline is recorded as a per-rollout high-water ordinal rather than a
+    wall-clock timestamp: rollout timestamps come from the file and clock skew
+    or a resumed session would make a time cutoff wrong. Files that appear
+    *after* activation have no baseline and are captured in full, which is
+    exactly the "new sessions" case.
+    """
+    existing = read_activation(palace_path)
+    if existing:
+        return existing
+
+    baseline: dict[str, int] = {}
+    for rollout in iter_rollouts(sessions_root):
+        highest = -1
+        try:
+            for turn in iter_turns(str(rollout)):
+                if turn.ordinal > highest:
+                    highest = turn.ordinal
+        except OSError:
+            continue
+        if highest >= 0:
+            baseline[rollout.stem] = highest
+
+    record = {
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+        "sessions_root": str(sessions_root),
+        "baseline": baseline,
+        "rollouts_at_activation": len(baseline),
+    }
+    try:
+        activation_path(palace_path).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover
+        logger.warning("codex follower: could not record activation point: %s", exc)
+    return record
+
+
+def _baseline_for(activation: Optional[dict], rollout_stem: str) -> Optional[int]:
+    if not activation:
+        return None
+    value = (activation.get("baseline") or {}).get(rollout_stem)
+    return value if isinstance(value, int) else None
+
+
+def plan_backfill(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
+    """What a ``--backfill`` would import, without writing anything."""
+    from .palace import get_collection
+
+    try:
+        collection = get_collection(palace_path, create=False)
+    except Exception:
+        collection = None
+
+    files = 0
+    turns = 0
+    already = 0
+    automations = 0
+    subagent_files = 0
+    subagent_turns = 0
+    destinations: dict[str, int] = {}
+    threads: set[str] = set()
+
+    for rollout in iter_rollouts(sessions_root):
+        files += 1
+        info = classify_rollout(str(rollout))
+        if info.get("automation"):
+            automations += 1
+            continue
+        is_subagent = info.get("thread_source") == "subagent"
+        if is_subagent:
+            subagent_files += 1
+        try:
+            rollout_turns = list(iter_turns(str(rollout)))
+        except OSError:
+            continue
+        ids = [t.drawer_id for t in rollout_turns]
+        present: set[str] = set()
+        if collection is not None and ids:
+            try:
+                found = collection.get(ids=ids, include=[])
+                present = set(found.get("ids") or [])
+            except Exception:
+                present = set()
+        for turn in rollout_turns:
+            turns += 1
+            threads.add(turn.thread_id)
+            if is_subagent:
+                subagent_turns += 1
+            if turn.drawer_id in present:
+                already += 1
+                continue
+            record = turn_to_drawer(turn, str(rollout))
+            key = f"{record.metadata.get('wing')}/{record.metadata.get('room')}"
+            destinations[key] = destinations.get(key, 0) + 1
+
+    return {
+        "files_scanned": files,
+        "turns_found": turns,
+        "estimated_new_drawers": sum(destinations.values()),
+        "already_present": already,
+        "automation_files_excluded": automations,
+        "subagent_files_included": subagent_files,
+        "subagent_turns_included": subagent_turns,
+        "threads_seen": len(threads),
+        "destinations": dict(sorted(destinations.items(), key=lambda kv: -kv[1])),
+    }
+
+
 def _stored_max_ordinal(collection, source_file: str) -> Optional[int]:
     """Highest ordinal already stored for a rollout, or None.
 
@@ -108,8 +240,15 @@ def scan_once(
     *,
     collection=None,
     max_turns: Optional[int] = None,
+    backfill: bool = False,
 ) -> dict:
     """One incremental pass over every rollout. Returns write statistics.
+
+    ``backfill=False`` (the default) honours the activation point: turns that
+    were already in a rollout when capture was switched on are left alone, so
+    installing the service captures new turns rather than silently importing
+    all of history. ``backfill=True`` ignores the baseline and imports
+    everything.
 
     ``max_turns`` bounds how many turns one call will write. It exists for the
     hub path: an unbounded first scan of a large corpus would hold the hub's
@@ -123,7 +262,9 @@ def scan_once(
     if own_collection:
         collection = get_collection(palace_path, create=True)
 
+    activation = None if backfill else read_activation(palace_path)
     added = already = skipped = 0
+    before_activation = 0
     files_scanned = 0
     written = 0
     pending = False
@@ -162,10 +303,19 @@ def scan_once(
             break
         files_scanned += 1
         source_file = str(rollout)
-        cursor = _stored_max_ordinal(collection, source_file)
+        # The cursor is a "don't re-read what we already passed" optimisation
+        # for forward capture. A backfill is deliberately going *backwards*
+        # into history, so honouring it there would skip exactly the turns the
+        # user asked to import.
+        cursor = None if backfill else _stored_max_ordinal(collection, source_file)
+        baseline = _baseline_for(activation, rollout.stem)
         try:
             turns = iter_turns(source_file)
             for turn in turns:
+                if baseline is not None and turn.ordinal <= baseline:
+                    # Predates activation; only --backfill imports these.
+                    before_activation += 1
+                    continue
                 if cursor is not None and turn.ordinal < cursor:
                     skipped += 1
                     continue
@@ -200,11 +350,15 @@ def scan_once(
         "drawers_added": added,
         "drawers_already_present": already,
         "turns_skipped_by_cursor": skipped,
+        "turns_before_activation": before_activation,
+        "backfill": backfill,
         "pending": pending,
     }
 
 
-def capture_pass(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
+def capture_pass(
+    palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT, *, backfill: bool = False
+) -> dict:
     """One capture pass, routed to whichever writer legitimately owns the palace.
 
     Exactly one of two paths runs, never both:
@@ -222,7 +376,7 @@ def capture_pass(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -
     from .codex_hub import HubRefused, HubUnavailable, capture_via_hub
 
     try:
-        stats = capture_via_hub(palace_path, sessions_root)
+        stats = capture_via_hub(palace_path, sessions_root, backfill=backfill)
         stats.setdefault("writer", "hub")
         stats["error"] = ""
         return stats
@@ -244,7 +398,7 @@ def capture_pass(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -
 
     try:
         with mine_palace_lock(palace_path):
-            stats = scan_once(palace_path, sessions_root)
+            stats = scan_once(palace_path, sessions_root, backfill=backfill)
     except MineAlreadyRunning as exc:
         # Another writer holds the lease but published no hub endpoint we can
         # reach. Refusing is correct — two writers is the one thing we must
@@ -263,9 +417,11 @@ def capture_pass(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -
     return stats
 
 
-def run_once(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
+def run_once(
+    palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT, *, backfill: bool = False
+) -> dict:
     """One capture pass plus a heartbeat, for `codex-capture --once`."""
-    stats = capture_pass(palace_path, sessions_root)
+    stats = capture_pass(palace_path, sessions_root, backfill=backfill)
     _write_heartbeat(palace_path, sessions_root=str(sessions_root), last_scan=stats, running=False)
     return stats
 

@@ -28,7 +28,7 @@ from tests.test_codex_capture import _item, _meta, _write_rollout
 def test_hub_is_used_when_one_owns_the_palace(tmp_path, monkeypatch):
     calls = {"hub": 0, "lock": 0}
 
-    def _fake_capture(palace_path, sessions_root):
+    def _fake_capture(palace_path, sessions_root, **kwargs):
         calls["hub"] += 1
         return {"writer": "hub", "drawers_added": 2, "drawers_already_present": 0}
 
@@ -57,7 +57,7 @@ def test_direct_write_only_when_no_hub_owns_the_palace(tmp_path):
 def test_hub_failure_is_never_retried_locally(tmp_path, monkeypatch):
     """A hub that answered may have written. Retrying locally = two writers."""
 
-    def _refuse(palace_path, sessions_root):
+    def _refuse(palace_path, sessions_root, **kwargs):
         raise codex_hub.HubRefused("hub returned HTTP 500 Internal Server Error")
 
     def _explode(*a, **k):
@@ -77,7 +77,7 @@ def test_lease_held_with_no_hub_is_reported_blocked_not_written(tmp_path, monkey
 
     monkeypatch.setattr(
         "mempalace.codex_hub.capture_via_hub",
-        lambda p, s: (_ for _ in ()).throw(codex_hub.HubUnavailable("none")),
+        lambda p, s, **kw: (_ for _ in ()).throw(codex_hub.HubUnavailable("none")),
     )
 
     def _held(*a, **k):
@@ -100,7 +100,7 @@ def test_no_turn_is_dropped_when_a_pass_is_blocked(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "mempalace.codex_hub.capture_via_hub",
-        lambda p, s: (_ for _ in ()).throw(codex_hub.HubUnavailable("none")),
+        lambda p, s, **kw: (_ for _ in ()).throw(codex_hub.HubUnavailable("none")),
     )
     real_lock = __import__("mempalace.palace", fromlist=["mine_palace_lock"]).mine_palace_lock
     monkeypatch.setattr(

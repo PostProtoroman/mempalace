@@ -1015,29 +1015,74 @@ def mine_source_adapter(
 
 
 def cmd_codex_capture(args):
-    """Install recall + start capturing Codex sessions into the palace."""
-    from . import codex_recall
-    from .codex_follower import DEFAULT_SESSIONS_ROOT, follow, run_once
+    """Capture Codex sessions into the palace.
+
+    Never touches ``~/.codex/AGENTS.md``. Recall is installed only by an
+    explicit ``mempalace codex-recall install`` — turning capture on and
+    changing the user's instructions file are separate decisions.
+    """
+    from .codex_follower import (
+        DEFAULT_SESSIONS_ROOT,
+        ensure_activation,
+        follow,
+        plan_backfill,
+        run_once,
+    )
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+    backfill = bool(getattr(args, "backfill", False))
 
-    if not args.no_recall:
-        result = codex_recall.install(args.agents_file)
-        verb = "Refreshed" if result["replaced"] else "Installed"
-        if result["changed"]:
-            print(f"  {verb} MemPalace recall block in {result['path']}")
-        else:
-            print(f"  Recall block already current in {result['path']}")
-
-    print(f"  Palace:        {palace_path}")
+    print(f"  Palace:         {palace_path}")
     print(f"  Codex sessions: {os.path.expanduser(sessions_root)}")
 
-    if args.once:
-        stats = run_once(palace_path, sessions_root)
+    if getattr(args, "dry_run", False):
+        if not backfill:
+            print(
+                "mempalace: --dry-run only applies to --backfill "
+                "(normal capture writes new turns as they appear)",
+                file=sys.stderr,
+            )
+            return 1
+        plan = plan_backfill(palace_path, sessions_root)
+        print("\n  Backfill plan (nothing written):")
+        print(f"    Rollout files scanned:      {plan['files_scanned']}")
+        print(f"    Conversation turns found:   {plan['turns_found']}")
+        print(f"    Estimated NEW drawers:      {plan['estimated_new_drawers']}")
+        print(f"    Already in the palace:      {plan['already_present']}")
+        print(f"    Automation files excluded:  {plan['automation_files_excluded']}")
         print(
-            f"  Scanned {stats['files_scanned']} rollout(s): "
-            f"+{stats['drawers_added']} new, "
+            f"    Subagent turns included:    {plan['subagent_turns_included']} "
+            f"(from {plan['subagent_files_included']} file(s), lineage preserved)"
+        )
+        print(f"    Threads:                    {plan['threads_seen']}")
+        if plan["destinations"]:
+            print("    Destination wings/rooms:")
+            for dest, count in list(plan["destinations"].items())[:15]:
+                print(f"      {dest}: {count}")
+        print("\n  Run again without --dry-run to import.")
+        return 0
+
+    # Recording the activation point before the first pass is what makes
+    # "capture new turns" the default: everything already in the rollouts is
+    # baselined and left alone unless --backfill is given.
+    if backfill:
+        print("  Mode:           BACKFILL (importing existing history)")
+    else:
+        activation = ensure_activation(palace_path, sessions_root)
+        print(
+            f"  Mode:           new turns only "
+            f"(activated {activation.get('activated_at', '?')[:19]}, "
+            f"{activation.get('rollouts_at_activation', 0)} existing rollout(s) baselined)"
+        )
+
+    if args.once:
+        stats = run_once(palace_path, sessions_root, backfill=backfill)
+        if stats.get("error"):
+            print(f"  Capture failed via {stats.get('writer')}: {stats['error']}", file=sys.stderr)
+            return 1
+        print(
+            f"  Wrote via {stats.get('writer')}: +{stats['drawers_added']} new, "
             f"{stats['drawers_already_present']} already present."
         )
         return 0
@@ -1046,6 +1091,26 @@ def cmd_codex_capture(args):
     totals = follow(palace_path, sessions_root, interval=args.interval)
     print(f"  Stopped after {totals['passes']} pass(es): +{totals['drawers_added']} new drawers.")
     return 0
+
+
+def cmd_codex_recall(args):
+    """Install or remove the MemPalace recall block in Codex's instructions."""
+    from . import codex_recall
+
+    action = getattr(args, "recall_action", None)
+    if action == "status":
+        installed = codex_recall.is_installed(args.agents_file)
+        print(f"  Recall block: {'installed' if installed else 'not installed'}")
+        print(f"  File:         {os.path.expanduser(args.agents_file)}")
+        return 0
+    if action == "install":
+        result = codex_recall.install(args.agents_file)
+        verb = "Refreshed" if result["replaced"] else "Installed"
+        print(f"  {verb} the MemPalace recall block in {result['path']}")
+        print("  Your own content in that file was preserved.")
+        return 0
+    print("mempalace: specify install | status", file=sys.stderr)
+    return 1
 
 
 def cmd_codex_status(args):
@@ -3196,19 +3261,43 @@ def main():
     # codex-capture
     p_codex = sub.add_parser(
         "codex-capture",
-        help="Capture Codex CLI sessions into the palace (installs recall, then follows)",
+        help="Capture Codex CLI sessions into the palace (never writes AGENTS.md)",
     )
     p_codex.add_argument("--palace", default=None, help="Palace path")
     p_codex.add_argument("--sessions-root", default=None, help="Codex sessions dir")
     p_codex.add_argument("--interval", type=float, default=15.0, help="Seconds between scans")
     p_codex.add_argument("--once", action="store_true", help="Single pass, then exit")
     p_codex.add_argument(
-        "--no-recall", action="store_true", help="Skip installing the recall block"
+        "--backfill",
+        action="store_true",
+        help="Import turns that predate activation (default: only new turns)",
+    )
+    p_codex.add_argument(
+        "--dry-run", action="store_true", help="With --backfill: report the plan, write nothing"
+    )
+    p_codex.add_argument(
+        "--no-recall",
+        action="store_true",
+        help="Accepted for compatibility; capture never writes AGENTS.md",
     )
     p_codex.add_argument(
         "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
     )
     p_codex.set_defaults(func=cmd_codex_capture)
+
+    p_codex_recall = sub.add_parser(
+        "codex-recall", help="Install the MemPalace recall block into Codex's AGENTS.md"
+    )
+    recall_sub = p_codex_recall.add_subparsers(dest="recall_action")
+    for _rname, _rhelp in (
+        ("install", "Write the recall block (preserves your own content)"),
+        ("status", "Show whether the recall block is installed"),
+    ):
+        _rp = recall_sub.add_parser(_rname, help=_rhelp)
+        _rp.add_argument(
+            "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+        )
+    p_codex_recall.set_defaults(func=cmd_codex_recall)
 
     p_codex_status = sub.add_parser("codex-status", help="Show whether Codex capture is active")
     p_codex_status.add_argument("--palace", default=None, help="Palace path")
@@ -3937,6 +4026,7 @@ def main():
         "codex-capture": cmd_codex_capture,
         "codex-status": cmd_codex_status,
         "codex-service": cmd_codex_service,
+        "codex-recall": cmd_codex_recall,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "serve": cmd_serve,

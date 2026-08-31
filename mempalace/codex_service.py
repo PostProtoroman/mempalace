@@ -55,6 +55,75 @@ def log_dir(palace_path: str) -> Path:
     return state_dir(palace_path)
 
 
+def resolve_executable(executable: Optional[str] = None) -> tuple[str, dict]:
+    """The exact interpreter + environment that can import *this* MemPalace.
+
+    A launchd job that runs a bare ``mempalace`` off PATH is a coin flip: the
+    login PATH is not the shell PATH, and on a machine with a venv, a uv tool
+    install and a Homebrew python, it may resolve to a build that does not
+    contain this feature at all — capture would "run" and quietly do the wrong
+    thing. So the plist gets an absolute interpreter path, and installation
+    refuses unless that interpreter imports the same package file this process
+    is running from.
+
+    Returns ``(executable, env)``. ``env`` carries ``PYTHONPATH`` when the
+    package is only importable from its source tree (editable / worktree
+    installs), so the job does not depend on site-packages layout.
+    """
+    import tempfile
+
+    import mempalace
+
+    candidate = executable or sys.executable
+    here = str(Path(mempalace.__file__).resolve().parent)
+    _PROBE = "import mempalace,sys; sys.stdout.write(mempalace.__file__)"
+
+    def _probe(pythonpath: Optional[str]) -> str:
+        # Run from a neutral directory: launched from the repo root, *any*
+        # interpreter "imports mempalace" off the current directory, so a
+        # cwd-inherited probe would happily bless a python that has no
+        # MemPalace installed at all. PYTHONPATH is dropped for the same
+        # reason unless we are the ones setting it.
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if pythonpath:
+            env["PYTHONPATH"] = pythonpath
+        try:
+            done = subprocess.run(
+                [candidate, "-c", _PROBE],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=tempfile.gettempdir(),
+                env=env,
+            )
+        except OSError:
+            return ""
+        if done.returncode != 0 or not done.stdout.strip():
+            return ""
+        return str(Path(done.stdout.strip()).resolve().parent)
+
+    env: dict[str, str] = {}
+    resolved = _probe(None)
+    if resolved != here:
+        # The PYTHONPATH fallback exists for running out of a source tree or
+        # worktree, where *this* interpreter already has the dependencies but
+        # the package is not on its path. It is deliberately not offered to a
+        # foreign interpreter: pointing some other python at this source tree
+        # produces a service that starts and then dies on the first import of
+        # a dependency it does not have.
+        parent = str(Path(here).parent)
+        resolved2 = _probe(parent) if candidate == sys.executable else ""
+        if resolved2 != here:
+            raise ServiceError(
+                f"{candidate} does not import this MemPalace "
+                f"(wanted {here}, got {resolved or resolved2 or 'nothing'}); "
+                "install the service from the environment you want it to run"
+            )
+        env["PYTHONPATH"] = parent
+
+    return candidate, env
+
+
 def _launchctl(*args: str, home: Optional[str] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["launchctl", *args],
@@ -78,8 +147,9 @@ def build_plist(
 ) -> dict:
     """The launchd job definition. Pure — no filesystem writes."""
     logs = log_dir(palace_path)
+    resolved_exe, extra_env = resolve_executable(executable)
     program = [
-        executable or sys.executable,
+        resolved_exe,
         "-m",
         "mempalace",
         "codex-capture",
@@ -89,8 +159,8 @@ def build_plist(
         str(sessions_root),
         "--interval",
         str(interval),
-        # The service must not rewrite the user's AGENTS.md on every login;
-        # recall installation is an explicit, separate step.
+        # The service never touches the user's AGENTS.md. Recall is installed
+        # only by an explicit `mempalace codex-recall install`.
         "--no-recall",
     ]
     return {
@@ -101,7 +171,7 @@ def build_plist(
         "ProcessType": "Background",
         "StandardOutPath": str(logs / "service.out.log"),
         "StandardErrorPath": str(logs / "service.err.log"),
-        "EnvironmentVariables": {"HOME": str(_home(home))},
+        "EnvironmentVariables": {"HOME": str(_home(home)), **extra_env},
     }
 
 

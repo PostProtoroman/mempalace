@@ -275,18 +275,42 @@ def iter_turns(path: str) -> Iterator[CodexTurn]:
             )
 
 
+def resolve_route(turn: CodexTurn, source_file: str) -> RouteHint:
+    """Wing and room for one turn, via the same resolvers conversation mining uses.
+
+    Codex turns used to land in ``unknown/unknown``, which is not a place —
+    they were searchable but unfiled, outside the palace's structure. Routing
+    goes through ``convo_miner._resolve_wing`` and ``detect_convo_room`` so a
+    Codex turn is filed exactly where the same conversation would land if it
+    had been mined by ``mempalace mine --mode convos``: ``wing_api`` for
+    AI-tool paths (``.codex`` is one), and a topic-scored room.
+    """
+    from ..convo_miner import _resolve_wing, detect_convo_room
+
+    wing = _resolve_wing(Path(source_file), None)
+    room = detect_convo_room(turn.text)
+    return RouteHint(wing=wing, room=room)
+
+
 def turn_to_drawer(turn: CodexTurn, source_file: str) -> DrawerRecord:
     """Build the drawer for one turn.
 
     The document is the user's exact words with a role prefix, matching the
     shape ``sweeper.py`` already writes for Claude Code transcripts so both
     read back the same way.
+
+    ``authored_at`` carries the turn's own timestamp — when it was *said* —
+    which is what the palace's date filters and ``authored-at`` docs expect;
+    ``filed_at`` (when it was ingested) is stamped by the follower.
     """
+    route = resolve_route(turn, source_file)
     return DrawerRecord(
         content=f"{turn.role.upper()}: {turn.text}",
         source_file=source_file,
         chunk_index=turn.ordinal,
         metadata={
+            "wing": route.wing,
+            "room": route.room,
             "session_id": turn.thread_id,
             "thread_id": turn.thread_id,
             "turn_id": turn.turn_id,
@@ -294,18 +318,56 @@ def turn_to_drawer(turn: CodexTurn, source_file: str) -> DrawerRecord:
             "message_uuid": turn.item_id,
             "role": turn.role,
             "timestamp": turn.timestamp,
+            "authored_at": turn.timestamp,
             "ordinal": turn.ordinal,
             "wire_format": turn.wire_format,
             "thread_source": turn.thread_source,
             "parent_thread_id": turn.parent_thread_id,
             "cwd": turn.cwd,
+            "workspace": turn.cwd,
             "originator": turn.originator,
             "agent": "codex",
+            "added_by": "codex",
             "ingest_mode": "codex_session",
             "drawer_id": turn.drawer_id,
         },
-        route_hint=RouteHint(wing="sessions"),
+        route_hint=route,
     )
+
+
+def classify_rollout(path: str) -> dict:
+    """Describe a rollout without extracting its turns.
+
+    ``iter_turns`` yields nothing for an automation run, which is correct for
+    capture but indistinguishable from "empty file" for a dry-run report that
+    has to say *why* something was excluded.
+    """
+    p = Path(path)
+    meta: dict = {}
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "session_meta":
+                    payload = entry.get("payload")
+                    if isinstance(payload, dict):
+                        meta = payload
+                    break
+    except OSError:
+        return {"automation": False, "thread_source": "", "originator": "", "readable": False}
+    return {
+        "automation": _is_automation(meta),
+        "thread_source": str(meta.get("thread_source") or ""),
+        "originator": str(meta.get("originator") or ""),
+        "parent_thread_id": str(meta.get("parent_thread_id") or ""),
+        "readable": True,
+    }
 
 
 def iter_rollouts(root: str) -> list[Path]:
@@ -372,6 +434,25 @@ class CodexSessionAdapter(BaseSourceAdapter):
                     indexed=True,
                 ),
                 "cwd": f(type="string", required=False, description="Session working directory"),
+                "workspace": f(
+                    type="string",
+                    required=False,
+                    description="Workspace (alias of cwd)",
+                    indexed=True,
+                ),
+                "wing": f(
+                    type="string", required=True, description="Destination wing", indexed=True
+                ),
+                "room": f(
+                    type="string", required=True, description="Destination room", indexed=True
+                ),
+                "authored_at": f(
+                    type="string",
+                    required=False,
+                    description="When the turn was said",
+                    indexed=True,
+                ),
+                "added_by": f(type="string", required=True, description="Always 'codex'"),
                 "originator": f(type="string", required=False, description="Codex client identity"),
                 "agent": f(
                     type="string", required=True, description="Always 'codex'", indexed=True
