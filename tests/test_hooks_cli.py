@@ -74,6 +74,25 @@ def _isolated_existing_palace_root(monkeypatch, tmp_path):
     return root
 
 
+@pytest.fixture(autouse=True)
+def _no_real_mine_subprocess(monkeypatch):
+    """Never let a hook test launch a real detached ``mempalace mine``.
+
+    ``hook_stop`` / ``hook_precompact`` call ``_ingest_transcript`` and
+    ``_maybe_auto_ingest`` unconditionally. Tests that only care about the
+    diary path patch ``_save_diary_direct`` and leave those alone, so each one
+    used to fork a real ``python -m mempalace mine`` against the session
+    palace. Being detached, the child outlived the test and kept the palace
+    writer lock, which made unrelated later modules fail -- notably
+    ``test_mcp_server.py::TestWriteTools::test_checkpoint_added_by_accepted_via_dispatch``,
+    whose mutating dispatch was then refused with "Peer MCP writer active".
+
+    Tests that assert on spawn behaviour patch ``Popen`` themselves inside a
+    ``with`` block, which takes precedence over this default.
+    """
+    monkeypatch.setattr(hooks_cli_mod.subprocess, "Popen", MagicMock())
+
+
 # --- _mempalace_python ---
 
 
