@@ -107,8 +107,16 @@ def scan_once(
     sessions_root: str = DEFAULT_SESSIONS_ROOT,
     *,
     collection=None,
+    max_turns: Optional[int] = None,
 ) -> dict:
-    """One incremental pass over every rollout. Returns write statistics."""
+    """One incremental pass over every rollout. Returns write statistics.
+
+    ``max_turns`` bounds how many turns one call will write. It exists for the
+    hub path: an unbounded first scan of a large corpus would hold the hub's
+    write path for minutes, which is the starvation mode this transport
+    already has history with. When the budget runs out the pass stops early
+    and reports ``pending: True`` so the caller comes straight back.
+    """
     from .palace import get_collection
 
     own_collection = collection is None
@@ -117,6 +125,8 @@ def scan_once(
 
     added = already = skipped = 0
     files_scanned = 0
+    written = 0
+    pending = False
     threads: set[str] = set()
 
     batch_ids: list[str] = []
@@ -148,6 +158,8 @@ def scan_once(
         batch_metas.clear()
 
     for rollout in iter_rollouts(sessions_root):
+        if pending:
+            break
         files_scanned += 1
         source_file = str(rollout)
         cursor = _stored_max_ordinal(collection, source_file)
@@ -167,8 +179,15 @@ def scan_once(
                 batch_ids.append(turn.drawer_id)
                 batch_docs.append(record.content)
                 batch_metas.append(meta)
+                written += 1
                 if len(batch_ids) >= BATCH_SIZE:
                     _flush()
+                if max_turns is not None and written >= max_turns:
+                    # Budget spent. Stop cleanly rather than truncating a
+                    # batch: the cursor and deterministic ids make the next
+                    # call resume exactly here without duplicating.
+                    pending = True
+                    break
         except OSError as exc:
             logger.warning("codex follower: unreadable rollout %s (%s)", source_file, exc)
             continue
@@ -181,15 +200,72 @@ def scan_once(
         "drawers_added": added,
         "drawers_already_present": already,
         "turns_skipped_by_cursor": skipped,
+        "pending": pending,
     }
 
 
-def run_once(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
-    """One locked pass. Chroma writes stay serialized behind the palace lock."""
-    from .palace import mine_palace_lock
+def capture_pass(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
+    """One capture pass, routed to whichever writer legitimately owns the palace.
 
-    with mine_palace_lock(palace_path):
-        stats = scan_once(palace_path, sessions_root)
+    Exactly one of two paths runs, never both:
+
+    * A live, writable hub owns the lease -> hand it the work over HTTP. This
+      process never touches the palace lock in that case.
+    * No hub -> take ``mine_palace_lock`` and write directly.
+
+    A hub that answered and then failed is *not* retried locally: it may have
+    applied the write, and a local retry would be a second writer. The failure
+    is returned so status can show it, and the next pass tries again — no turn
+    is dropped, because unwritten turns are still in the rollout and the
+    cursor never advanced past them.
+    """
+    from .codex_hub import HubRefused, HubUnavailable, capture_via_hub
+
+    try:
+        stats = capture_via_hub(palace_path, sessions_root)
+        stats.setdefault("writer", "hub")
+        stats["error"] = ""
+        return stats
+    except HubUnavailable as exc:
+        logger.debug("codex follower: no hub (%s); writing directly", exc)
+    except HubRefused as exc:
+        logger.error("codex follower: hub refused capture (%s)", exc)
+        return {
+            "writer": "hub",
+            "error": str(exc),
+            "drawers_added": 0,
+            "drawers_already_present": 0,
+            "turns_skipped_by_cursor": 0,
+            "files_scanned": 0,
+            "threads_seen": 0,
+        }
+
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        with mine_palace_lock(palace_path):
+            stats = scan_once(palace_path, sessions_root)
+    except MineAlreadyRunning as exc:
+        # Another writer holds the lease but published no hub endpoint we can
+        # reach. Refusing is correct — two writers is the one thing we must
+        # never do — and the turns stay in the rollout for the next pass.
+        return {
+            "writer": "blocked",
+            "error": f"palace writer lease held by another process: {exc}",
+            "drawers_added": 0,
+            "drawers_already_present": 0,
+            "turns_skipped_by_cursor": 0,
+            "files_scanned": 0,
+            "threads_seen": 0,
+        }
+    stats["writer"] = "direct"
+    stats["error"] = ""
+    return stats
+
+
+def run_once(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
+    """One capture pass plus a heartbeat, for `codex-capture --once`."""
+    stats = capture_pass(palace_path, sessions_root)
     _write_heartbeat(palace_path, sessions_root=str(sessions_root), last_scan=stats, running=False)
     return stats
 
@@ -202,14 +278,11 @@ def follow(
     max_passes: Optional[int] = None,
 ) -> dict:
     """Scan on an interval until interrupted (or ``max_passes`` is reached)."""
-    from .palace import mine_palace_lock
-
     passes = 0
     totals = {"drawers_added": 0, "drawers_already_present": 0, "passes": 0}
     try:
         while max_passes is None or passes < max_passes:
-            with mine_palace_lock(palace_path):
-                stats = scan_once(palace_path, sessions_root)
+            stats = capture_pass(palace_path, sessions_root)
             passes += 1
             totals["drawers_added"] += stats["drawers_added"]
             totals["drawers_already_present"] += stats["drawers_already_present"]
@@ -234,18 +307,64 @@ def follow(
     return totals
 
 
+def _lag_seconds(latest_turn_at: str, heartbeat_at: str) -> Optional[float]:
+    """Seconds between the newest captured turn and the last successful pass.
+
+    This is capture lag: how far behind the palace is, not how long ago the
+    follower ran. Unparseable timestamps yield None rather than a wrong number.
+    """
+    from datetime import datetime as _dt
+
+    def _parse(value: str):
+        if not value:
+            return None
+        try:
+            return _dt.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    turn = _parse(latest_turn_at)
+    beat = _parse(heartbeat_at)
+    if turn is None or beat is None:
+        return None
+    if turn.tzinfo is None:
+        turn = turn.replace(tzinfo=timezone.utc)
+    if beat.tzinfo is None:
+        beat = beat.replace(tzinfo=timezone.utc)
+    return max(0.0, (beat - turn).total_seconds())
+
+
 def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
-    """Everything needed to prove capture is (or is not) active."""
-    from .palace import get_collection
+    """Capture health, as one of ACTIVE / DEGRADED / BLOCKED.
+
+    * ``ACTIVE``   — the follower is running and its last pass wrote cleanly.
+    * ``DEGRADED`` — capture is configured and the palace has turns, but the
+      follower is not running, or its last pass reported an error it can
+      recover from on the next attempt.
+    * ``BLOCKED``  — the last pass could not write at all: another process
+      owns the writer lease with no reachable hub, or the hub refused. Turns
+      are not lost, but nothing is being captured until it clears.
+    """
+    from .codex_hub import hub_is_healthy, hub_target
 
     hb = read_heartbeat(palace_path) or {}
     pid = hb.get("pid")
-    live = bool(pid) and _pid_alive(int(pid)) and bool(hb.get("running"))
+    running = bool(pid) and _pid_alive(int(pid)) and bool(hb.get("running"))
+    last = hb.get("last_scan") or {}
+    last_error = str(last.get("error") or "")
+    writer = str(last.get("writer") or "")
+
+    target = hub_target(palace_path)
+    hub_url = target[0] if target else ""
+    hub_reachable = bool(target) and hub_is_healthy(*target)
 
     drawers = 0
     threads: set[str] = set()
     latest = ""
+    palace_error = ""
     try:
+        from .palace import get_collection
+
         collection = get_collection(palace_path, create=False)
         data = collection.get(where={"ingest_mode": "codex_session"}, include=["metadatas"])
         metas = data.get("metadatas") or []
@@ -259,16 +378,30 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
             if ts > latest:
                 latest = ts
     except Exception as exc:
+        palace_error = f"{type(exc).__name__}: {exc}"
         logger.warning("codex status: palace read failed (%s)", exc)
 
+    if writer == "blocked" or (writer == "hub" and last_error):
+        state = "BLOCKED"
+    elif running and not last_error:
+        state = "ACTIVE"
+    else:
+        state = "DEGRADED"
+
     return {
-        "follower_running": live,
+        "state": state,
+        "follower_running": running,
         "follower_pid": pid,
         "heartbeat_at": hb.get("updated_at"),
+        "writer": writer or ("hub" if hub_reachable else "direct"),
+        "hub_url": hub_url,
+        "hub_reachable": hub_reachable,
         "sessions_root": hb.get("sessions_root") or str(sessions_root),
         "rollouts_on_disk": len(iter_rollouts(sessions_root)),
         "codex_drawers": drawers,
         "codex_threads": len(threads),
         "latest_turn_at": latest,
-        "last_scan": hb.get("last_scan"),
+        "capture_lag_seconds": _lag_seconds(latest, hb.get("updated_at") or ""),
+        "last_error": last_error or palace_error,
+        "last_scan": last,
     }

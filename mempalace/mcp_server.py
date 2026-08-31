@@ -430,6 +430,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_mine",
+        "mempalace_codex_capture",
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
@@ -477,6 +478,7 @@ _VECTOR_WRITE_TOOLS = frozenset(
         "mempalace_diary_write",
         "mempalace_checkpoint",
         "mempalace_mine",
+        "mempalace_codex_capture",
         "mempalace_sync",
     }
 )
@@ -4937,6 +4939,46 @@ def tool_patch_submit(
 
 # ==================== MCP PROTOCOL ====================
 
+
+def tool_codex_capture(sessions_root: str = "", max_turns: int = 500):
+    """Capture Codex session turns into the palace from inside the hub.
+
+    Exists so the Codex follower never has to compete for the palace writer
+    lease. A hub owns that lease for its whole lifetime, so a follower that
+    took ``mine_palace_lock`` directly would be refused on exactly the
+    machines a hub is running on — capture would silently stop. Handing the
+    work to the lease holder keeps a single writer.
+
+    ``max_turns`` bounds one call so a first-time scan of a large corpus
+    cannot park the hub's write path for minutes at a time (the starvation
+    this transport already has a history of). The caller repeats while
+    ``pending`` is true; each call is short and other requests interleave
+    between them.
+    """
+    from .codex_follower import DEFAULT_SESSIONS_ROOT, scan_once
+
+    if not _config.palace_path:
+        np = _no_palace()
+        return {"success": False, "error": np.get("error", "no palace")}
+
+    root = sessions_root or DEFAULT_SESSIONS_ROOT
+    try:
+        budget = int(max_turns)
+    except (TypeError, ValueError):
+        budget = 500
+    if budget <= 0:
+        budget = 500
+
+    try:
+        # The hub already holds the writer lease; scan_once must not take it
+        # again, so it is called directly rather than through run_once.
+        stats = scan_once(_config.palace_path, root, max_turns=budget)
+    except Exception as exc:  # pragma: no cover - surfaced to the caller
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return {"success": True, **stats}
+
+
 TOOLS = {
     "mempalace_status": {
         "description": "Palace overview — total drawers, wing and room counts",
@@ -5361,6 +5403,27 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_codex_capture": {
+        "description": (
+            "Capture Codex CLI session turns into the palace from inside the hub, so the "
+            "follower never competes for the palace writer lease. Bounded by max_turns; "
+            "repeat while the response has pending=true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sessions_root": {
+                    "type": "string",
+                    "description": "Codex sessions dir (default: ~/.codex/sessions).",
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "description": "Max turns to write in this call (default 500).",
+                },
+            },
+        },
+        "handler": tool_codex_capture,
     },
     "mempalace_mine": {
         "description": (
