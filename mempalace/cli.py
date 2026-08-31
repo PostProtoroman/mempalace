@@ -1014,6 +1014,65 @@ def mine_source_adapter(
                 knowledge_graph.close()
 
 
+def cmd_codex_capture(args):
+    """Install recall + start capturing Codex sessions into the palace."""
+    from . import codex_recall
+    from .codex_follower import DEFAULT_SESSIONS_ROOT, follow, run_once
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+
+    if not args.no_recall:
+        result = codex_recall.install(args.agents_file)
+        verb = "Refreshed" if result["replaced"] else "Installed"
+        if result["changed"]:
+            print(f"  {verb} MemPalace recall block in {result['path']}")
+        else:
+            print(f"  Recall block already current in {result['path']}")
+
+    print(f"  Palace:        {palace_path}")
+    print(f"  Codex sessions: {os.path.expanduser(sessions_root)}")
+
+    if args.once:
+        stats = run_once(palace_path, sessions_root)
+        print(
+            f"  Scanned {stats['files_scanned']} rollout(s): "
+            f"+{stats['drawers_added']} new, "
+            f"{stats['drawers_already_present']} already present."
+        )
+        return 0
+
+    print(f"  Following every {args.interval:.0f}s. Ctrl-C to stop.")
+    totals = follow(palace_path, sessions_root, interval=args.interval)
+    print(f"  Stopped after {totals['passes']} pass(es): +{totals['drawers_added']} new drawers.")
+    return 0
+
+
+def cmd_codex_status(args):
+    """Show whether Codex capture is active and what it has stored."""
+    from . import codex_recall
+    from .codex_follower import DEFAULT_SESSIONS_ROOT, status
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+    st = status(palace_path, sessions_root)
+
+    state = "ACTIVE" if st["follower_running"] else "not running"
+    print(f"  Codex capture:  {state}")
+    if st["follower_pid"]:
+        print(f"  Follower PID:   {st['follower_pid']}")
+    if st["heartbeat_at"]:
+        print(f"  Last heartbeat: {st['heartbeat_at']}")
+    print(f"  Sessions root:  {os.path.expanduser(st['sessions_root'])}")
+    print(f"  Rollouts seen:  {st['rollouts_on_disk']}")
+    print(f"  Codex drawers:  {st['codex_drawers']} across {st['codex_threads']} thread(s)")
+    if st["latest_turn_at"]:
+        print(f"  Latest turn:    {st['latest_turn_at']}")
+    installed = codex_recall.is_installed(args.agents_file)
+    print(f"  Recall block:   {'installed' if installed else 'MISSING'}")
+    return 0
+
+
 def cmd_sweep(args):
     """Sweep a transcript file or directory.
 
@@ -3063,6 +3122,31 @@ def main():
     )
 
     # sweep
+    # codex-capture
+    p_codex = sub.add_parser(
+        "codex-capture",
+        help="Capture Codex CLI sessions into the palace (installs recall, then follows)",
+    )
+    p_codex.add_argument("--palace", default=None, help="Palace path")
+    p_codex.add_argument("--sessions-root", default=None, help="Codex sessions dir")
+    p_codex.add_argument("--interval", type=float, default=15.0, help="Seconds between scans")
+    p_codex.add_argument("--once", action="store_true", help="Single pass, then exit")
+    p_codex.add_argument(
+        "--no-recall", action="store_true", help="Skip installing the recall block"
+    )
+    p_codex.add_argument(
+        "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+    )
+    p_codex.set_defaults(func=cmd_codex_capture)
+
+    p_codex_status = sub.add_parser("codex-status", help="Show whether Codex capture is active")
+    p_codex_status.add_argument("--palace", default=None, help="Palace path")
+    p_codex_status.add_argument("--sessions-root", default=None, help="Codex sessions dir")
+    p_codex_status.add_argument(
+        "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+    )
+    p_codex_status.set_defaults(func=cmd_codex_status)
+
     p_sweep = sub.add_parser(
         "sweep",
         help="Tandem miner: catch anything the primary miner missed "
@@ -3759,6 +3843,8 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,
+        "codex-capture": cmd_codex_capture,
+        "codex-status": cmd_codex_status,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
