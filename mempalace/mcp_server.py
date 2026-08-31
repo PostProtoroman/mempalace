@@ -7191,6 +7191,28 @@ _HTTP_LOCK_FREE_TOOLS = frozenset(
     }
 )
 
+# The MCP handshake (initialize -> notifications/initialized -> tools/list)
+# and ping are answered from module state alone: protocol constants, the
+# TOOLS dict and the _READ_ONLY flag. They never open Chroma, the KG or the
+# palace, so holding _HTTP_REQUEST_LOCK across them buys no serialization and
+# costs every new connection: mempalace_mine can sit in the palace write path
+# for over a minute (chromadb writes have no timeout), and a client whose
+# handshake landed in that window timed out against a hub that was otherwise
+# healthy and serving /healthz.
+#
+# Enumerated rather than matched by prefix: this set is exactly the methods
+# whose handlers have been read and confirmed palace-free. A future
+# notifications/* method is not covered by that audit, so it keeps the lock
+# until someone checks it.
+_HTTP_LOCK_FREE_METHODS = frozenset(
+    {
+        "initialize",
+        "notifications/initialized",
+        "ping",
+        "tools/list",
+    }
+)
+
 # SSE stream limits (GET /logstream/stream). Each connected client holds one
 # handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
 _SSE_MAX_CLIENTS_ENV = "MEMPALACE_SSE_MAX_CLIENTS"
@@ -7449,18 +7471,25 @@ def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
     The global request lock preserves the single-process / single-palace-
-    handle behavior stdio deployments rely on. Logstream tools are the one
-    exception: they never touch Chroma/KG state and carry their own database
-    lock, and serializing them would let one agent's event_wait long-poll
-    (up to 5 minutes) starve the whole hub.
+    handle behavior stdio deployments rely on. Two kinds of request are
+    dispatched outside it:
+
+    - Logstream tools, which never touch Chroma/KG state and carry their own
+      database lock; serializing them would let one agent's event_wait
+      long-poll (up to 5 minutes) starve the whole hub.
+    - The handshake and liveness methods in _HTTP_LOCK_FREE_METHODS, which
+      are answered from module state alone.
     """
-    if (
-        isinstance(request, dict)
-        and request.get("method") == "tools/call"
-        and isinstance(request.get("params"), dict)
-        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
-    ):
-        return handle_request(request)
+    if isinstance(request, dict):
+        method = request.get("method") or ""
+        if method in _HTTP_LOCK_FREE_METHODS:
+            return handle_request(request)
+        if (
+            method == "tools/call"
+            and isinstance(request.get("params"), dict)
+            and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
+        ):
+            return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)
 
