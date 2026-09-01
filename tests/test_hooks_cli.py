@@ -20,12 +20,16 @@ from mempalace.hooks_cli import (
     _extract_recent_messages,
     _get_mine_targets,
     _hooks_daemon_enabled,
+    _ingest_transcript_if_due,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
     _mine_already_running,
+    _mine_marker_path,
+    _mine_rate_limited,
     _mine_sync,
     _parse_harness_input,
+    _record_mine_fired,
     _safe_wing_slug,
     _sanitize_session_id,
     _save_diary_direct,
@@ -227,6 +231,99 @@ def test_count_handles_list_content(tmp_path):
         ],
     )
     assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_skips_tool_result_only_user_record(tmp_path):
+    """Claude Code delivers tool results as user-role records whose content
+    blocks are ``tool_result`` with no ``"text"`` key. These carry no human
+    text and must not count as a human message."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "real question"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "some tool output",
+                        }
+                    ],
+                }
+            },
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_skips_empty_or_whitespace_only_content(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "real question"}},
+            {"message": {"role": "user", "content": "   "}},
+            {"message": {"role": "user", "content": ""}},
+            {"message": {"role": "user", "content": [{"type": "text", "text": "  \n "}]}},
+            {"message": {"role": "user", "content": []}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_still_counts_mixed_tool_result_and_real_text(tmp_path):
+    """A record that mixes a tool_result block with an actual text block
+    (e.g. a human message sent alongside tool output) still counts -- only
+    records that are *exclusively* tool_result blocks are skipped."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "output"},
+                        {"type": "text", "text": "also here's a real question"},
+                    ],
+                }
+            }
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_human_messages_agentic_session_ignores_tool_results(tmp_path):
+    """Regression for the ~6x Stop-hook overcount that made the every-15
+    threshold fire every ~2-3 real messages: a realistic agentic session
+    interleaves each real human turn with several user-role tool_result-only
+    records. Only the N real human turns count."""
+    transcript = tmp_path / "agentic.jsonl"
+    entries = []
+    n = 20
+    for i in range(n):
+        entries.append({"message": {"role": "user", "content": f"human turn {i}"}})
+        entries.append({"message": {"role": "assistant", "content": "on it"}})
+        for j in range(6):
+            entries.append(
+                {
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": f"toolu_{i}_{j}",
+                                "content": "tool output " * 5,
+                            }
+                        ],
+                    }
+                }
+            )
+    _write_transcript(transcript, entries)
+    assert _count_human_messages(str(transcript)) == n
 
 
 def test_count_missing_file():
@@ -1675,6 +1772,190 @@ def test_mine_already_running_distinct_cmds_independent(tmp_path):
     with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
         assert _mine_already_running(cmd_a) is True
         assert _mine_already_running(cmd_b) is False
+
+
+# --- transcript-mine rate limit (_mine_rate_limited / _ingest_transcript_if_due) ---
+
+
+def test_mine_rate_limited_false_with_no_marker(tmp_path):
+    """No prior mine recorded for this transcript -- never rate-limited."""
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        assert _mine_rate_limited(tmp_path / "t.jsonl", 600) is False
+
+
+def test_mine_rate_limited_true_inside_window(tmp_path):
+    target = tmp_path / "t.jsonl"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        _record_mine_fired(target)
+        assert _mine_rate_limited(target, 600) is True
+
+
+def test_mine_rate_limited_false_after_window_elapses(tmp_path):
+    import time as _time
+
+    target = tmp_path / "t.jsonl"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        marker = _mine_marker_path(target)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(_time.time() - 601), encoding="utf-8")
+        assert _mine_rate_limited(target, 600) is False
+
+
+def test_mine_rate_limited_disabled_when_interval_zero(tmp_path):
+    target = tmp_path / "t.jsonl"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        _record_mine_fired(target)
+        assert _mine_rate_limited(target, 0) is False
+
+
+def test_mine_rate_limited_ignores_corrupt_marker(tmp_path):
+    """A garbage marker file must not crash or wedge the mine open -- treated
+    like "never mined", not like an error that blocks the mine."""
+    target = tmp_path / "t.jsonl"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        marker = _mine_marker_path(target)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("not-a-timestamp", encoding="utf-8")
+        assert _mine_rate_limited(target, 600) is False
+
+
+def test_ingest_transcript_if_due_fires_with_no_prior_marker(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest:
+            result = _ingest_transcript_if_due(str(transcript), 600)
+    mock_ingest.assert_called_once_with(str(transcript))
+    assert result is True
+
+
+def test_ingest_transcript_if_due_skips_inside_window(tmp_path):
+    """A Stop that arrives inside the rate-limit window skips the mine."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        _record_mine_fired(_validate_transcript_path(str(transcript)))
+        with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
+            result = _ingest_transcript_if_due(str(transcript), 600)
+    mock_ingest.assert_not_called()
+    assert result is True  # nothing outstanding -- a recent mine already covers it
+
+
+def test_ingest_transcript_if_due_skip_is_logged(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        _record_mine_fired(_validate_transcript_path(str(transcript)))
+        with patch("mempalace.hooks_cli._ingest_transcript"):
+            with patch("mempalace.hooks_cli._log") as mock_log:
+                _ingest_transcript_if_due(str(transcript), 600)
+    assert any("rate-limited" in call.args[0] for call in mock_log.call_args_list)
+
+
+def test_ingest_transcript_if_due_fires_after_interval(tmp_path):
+    """Fires again once the configured interval has elapsed."""
+    import time as _time
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        marker = _mine_marker_path(_validate_transcript_path(str(transcript)))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(_time.time() - 700), encoding="utf-8")
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest:
+            result = _ingest_transcript_if_due(str(transcript), 600)
+    mock_ingest.assert_called_once_with(str(transcript))
+    assert result is True
+
+
+def test_ingest_transcript_if_due_state_survives_across_invocations(tmp_path):
+    """The last-mine marker is a file under STATE_DIR, not in-process state --
+    two sequential "CLI calls" (separate top-level invocations of the
+    function, as two separate hook subprocess fires would be) must share it."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest:
+            # First invocation: no marker yet, fires and persists one to disk.
+            _ingest_transcript_if_due(str(transcript), 600)
+        assert mock_ingest.call_count == 1
+        marker = _mine_marker_path(_validate_transcript_path(str(transcript)))
+        assert marker.is_file()
+
+        # Second, independent invocation (simulating a fresh hook subprocess
+        # reading the same on-disk state) must see the marker and skip.
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest2:
+            _ingest_transcript_if_due(str(transcript), 600)
+        mock_ingest2.assert_not_called()
+
+
+def test_ingest_transcript_if_due_does_not_arm_window_on_dispatch_failure(tmp_path):
+    """When the underlying dispatch fails (blocked routing, spawn error --
+    _ingest_transcript returns False), the rate-limit marker must NOT be
+    recorded: a failed attempt is not "recently mined", and #2403 defect 4's
+    retry-on-total-failure guarantee requires the very next Stop to retry,
+    not wait out the window."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=False):
+            result = _ingest_transcript_if_due(str(transcript), 600)
+        assert result is False
+        marker = _mine_marker_path(_validate_transcript_path(str(transcript)))
+        assert not marker.exists()
+
+        # Next fire retries immediately -- not rate-limited.
+        with patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest:
+            _ingest_transcript_if_due(str(transcript), 600)
+        mock_ingest.assert_called_once()
+
+
+def test_stop_hook_rate_limits_remine_but_still_checkpoints(tmp_path):
+    """Two Stop-hook fires close together for the same transcript: the
+    second must skip the transcript re-mine (rate-limited) but still write
+    its diary checkpoint -- the rate limit only ever gates the mine."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "ratelimit",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hooks_mine_interval_secs = 600
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 15, "themes": []},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            result1 = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+            assert mock_ingest.call_count == 1
+
+            # More messages arrive and the next Stop fires moments later --
+            # still well inside the 600s rate-limit window.
+            _write_transcript(
+                transcript,
+                [
+                    {"message": {"role": "user", "content": f"msg {i}"}}
+                    for i in range(SAVE_INTERVAL * 2)
+                ],
+            )
+            result2 = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+
+    assert "systemMessage" in result1
+    assert "systemMessage" in result2  # diary checkpoint still ran both times
+    assert mock_save.call_count == 2
+    assert mock_ingest.call_count == 1  # second mine was rate-limited
 
 
 # --- _get_mine_targets ---

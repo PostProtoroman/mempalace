@@ -1139,3 +1139,72 @@ def test_hooks_mine_transcript_non_dict_hooks_falls_back():
         json.dump({"hooks": "nonsense"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.hooks_mine_transcript is True
+
+
+# --- hooks.mine_interval_secs ---
+
+
+def test_hooks_mine_interval_secs_default():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_mine_interval_secs == 600
+
+
+def test_hooks_mine_interval_secs_from_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_interval_secs": 120}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_interval_secs == 120
+
+
+def test_hooks_mine_interval_secs_zero_disables():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_interval_secs": 0}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_interval_secs == 0
+
+
+def test_hooks_mine_interval_secs_garbage_falls_back_to_default():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_interval_secs": "not-a-number"}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_interval_secs == 600
+
+
+def test_hooks_mine_interval_secs_negative_falls_back_to_default():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_interval_secs": -5}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_interval_secs == 600
+
+
+def test_hooks_mine_interval_secs_non_dict_hooks_falls_back():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": "nonsense"}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_interval_secs == 600
+
+
+def test_hooks_mine_interval_secs_env_override():
+    os.environ["MEMPALACE_HOOKS_MINE_INTERVAL_SECS"] = "30"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_mine_interval_secs == 30
+    finally:
+        del os.environ["MEMPALACE_HOOKS_MINE_INTERVAL_SECS"]
+
+
+def test_hooks_mine_interval_secs_env_overrides_config_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_interval_secs": 900}}, f)
+    os.environ["MEMPALACE_HOOKS_MINE_INTERVAL_SECS"] = "45"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hooks_mine_interval_secs == 45
+    finally:
+        del os.environ["MEMPALACE_HOOKS_MINE_INTERVAL_SECS"]

@@ -151,7 +151,19 @@ def _validate_transcript_path(transcript_path: str) -> Path:
 
 
 def _count_human_messages(transcript_path: str) -> int:
-    """Count human messages in a JSONL transcript, skipping command-messages."""
+    """Count human messages in a JSONL transcript, skipping command-messages.
+
+    Claude Code delivers tool results as user-role JSONL records — their
+    content blocks are ``{"type": "tool_result", ...}`` with no ``"text"``
+    key. In an agentic session those tool-result records vastly outnumber
+    real human turns (~6x observed), so a naive "every user-role record
+    counts" scan overcounts and fires the Stop-hook save/mine threshold
+    every ~2-3 real messages instead of every ``SAVE_INTERVAL``. Only
+    records that carry actual human text count: a record whose content is
+    exclusively ``tool_result`` blocks, or whose joined text is empty or
+    whitespace-only, is skipped — matching how ``normalize._try_claude_code_jsonl``
+    already distinguishes tool-only turns from real ones.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
         if transcript_path:
@@ -171,11 +183,21 @@ def _count_human_messages(transcript_path: str) -> int:
                         if isinstance(content, str):
                             if "<command-message>" in content:
                                 continue
+                            if not content.strip():
+                                continue
                         elif isinstance(content, list):
+                            # Tool-result-only records carry no human text.
+                            if content and all(
+                                isinstance(b, dict) and b.get("type") == "tool_result"
+                                for b in content
+                            ):
+                                continue
                             text = " ".join(
                                 b.get("text", "") for b in content if isinstance(b, dict)
                             )
                             if "<command-message>" in text:
+                                continue
+                            if not text.strip():
                                 continue
                         count += 1
                     # Also handle Codex CLI transcript format
@@ -1183,6 +1205,53 @@ def _save_diary_direct(
     return {"count": 0}
 
 
+def _mine_marker_path(path: Path) -> Path:
+    """Per-transcript last-Stop-mine-timestamp marker.
+
+    Keyed by a hash of the resolved transcript path (same scheme as
+    ``_pid_file_for_cmd``/``_daemon_mine_dedupe_key``) so every Stop-hook
+    fire for the same transcript shares one rate-limit window regardless of
+    which session_id triggered it. Only ``_ingest_transcript_if_due``
+    (the Stop-hook path) reads or writes this marker.
+    """
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    return STATE_DIR / f"mine_last_{digest}"
+
+
+def _mine_rate_limited(path: Path, interval_secs) -> bool:
+    """True if a transcript mine for ``path`` already ran within ``interval_secs``.
+
+    ``interval_secs <= 0`` (or unreadable) disables the limit — every call
+    is allowed through. A missing/corrupt marker is treated as "never
+    mined", never as an error that blocks the mine.
+    """
+    try:
+        interval_secs = float(interval_secs)
+    except (TypeError, ValueError):
+        return False
+    if interval_secs <= 0:
+        return False
+    try:
+        last = float(_mine_marker_path(path).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return (time.time() - last) < interval_secs
+
+
+def _record_mine_fired(path: Path) -> None:
+    """Persist "now" as the last-mine timestamp for ``path``.
+
+    Best-effort: a failure to write must never fail the hook (the mine
+    itself may still proceed; only the *next* call's rate-limit window
+    would be affected).
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _mine_marker_path(path).write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _ingest_transcript(transcript_path: str) -> bool:
     """Mine a Claude Code session transcript into the palace as a conversation.
 
@@ -1192,6 +1261,12 @@ def _ingest_transcript(transcript_path: str) -> bool:
     false, nothing to mine). Returns False when work exists but could not
     be dispatched (blocked routing, spawn failure), so the caller keeps its
     throttling marker and retries at the next fire (#2403 defect 4).
+
+    Unconditional with respect to the re-mine rate limit — PreCompact and
+    SessionEnd call this directly and must always capture the transcript
+    (a compaction or clean exit warrants it regardless of how recently a
+    mine last ran). The Stop hook enforces the rate limit itself, via
+    ``_ingest_transcript_if_due``, before ever reaching here.
     """
     path = _validate_transcript_path(transcript_path)
     if path is None:
@@ -1264,6 +1339,51 @@ def _ingest_transcript(transcript_path: str) -> bool:
         # block above handles its own errors).
         _log(f"transcript ingest hook failed: {exc}")
         return False
+
+
+def _ingest_transcript_if_due(transcript_path: str, interval_secs) -> bool:
+    """Stop-hook entry point: mine ``transcript_path`` unless it was mined
+    (via this function) within ``interval_secs``.
+
+    An overcounted (or simply chatty) Stop-hook fire rate must not spawn a
+    new mine subprocess for the same transcript faster than the configured
+    window. A skip is logged at info and never blocks the diary checkpoint,
+    which the caller writes independently before reaching this call.
+
+    Returns the same "no work left outstanding" bool as ``_ingest_transcript``
+    (see #2403 defect 4) so the Stop hook's save-marker logic keeps working
+    unchanged: a rate-limited skip means a mine already ran recently enough
+    that nothing new needs doing, so it counts as True here too — treating
+    it as False would make the marker withhold on every subsequent Stop
+    while the window holds, re-entering the whole "TRIGGERING SAVE" block
+    (and retrying the diary write) on every single fire instead of only
+    every ``SAVE_INTERVAL`` messages, reintroducing defect 4's symptom
+    around the rate limit instead of the counter.
+
+    The last-mine timestamp is recorded only *after* ``_ingest_transcript``
+    reports the dispatch as succeeded (True) — never before, and never on a
+    False (blocked routing, spawn failure). Recording it unconditionally
+    would start the rate-limit window on a fire that dispatched nothing,
+    silently swallowing defect 4's retry-on-total-failure guarantee: a
+    transcript stuck behind a blocked write route would look "recently
+    mined" and skip every retry for the full window instead of retrying on
+    the very next Stop.
+
+    PreCompact and SessionEnd are never rate-limited: they call
+    ``_ingest_transcript`` directly and do not go through this wrapper, so
+    a compaction or clean exit always captures the transcript regardless of
+    how recently Stop mined it.
+    """
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
+        return _ingest_transcript(transcript_path)
+    if _mine_rate_limited(path, interval_secs):
+        _log(f"Transcript mine rate-limited (< {interval_secs}s since last mine): {path.name}")
+        return True
+    dispatched = _ingest_transcript(transcript_path)
+    if dispatched:
+        _record_mine_fired(path)
+    return dispatched
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
@@ -1501,9 +1621,11 @@ def hook_stop(data: dict, harness: str):
                 config = MempalaceConfig()
                 silent = config.hook_silent_save
                 toast = config.hook_desktop_toast
+                mine_interval_secs = config.hooks_mine_interval_secs
             except Exception:
                 silent = True
                 toast = False
+                mine_interval_secs = 600
 
             project_wing = _wing_from_transcript_path(transcript_path)
 
@@ -1519,7 +1641,9 @@ def hook_stop(data: dict, harness: str):
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
                     )
-                    ingest_dispatched = _ingest_transcript(transcript_path)
+                    ingest_dispatched = _ingest_transcript_if_due(
+                        transcript_path, mine_interval_secs
+                    )
                 _maybe_auto_ingest()
                 # Advance the save marker when the diary checkpoint landed OR
                 # the transcript ingest is in flight. Gating it on the diary
@@ -1560,7 +1684,7 @@ def hook_stop(data: dict, harness: str):
                 except OSError:
                     pass
                 if transcript_path:
-                    _ingest_transcript(transcript_path)
+                    _ingest_transcript_if_due(transcript_path, mine_interval_secs)
                 _maybe_auto_ingest()
                 reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
                 _output({"decision": "block", "reason": reason})
