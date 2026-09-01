@@ -153,7 +153,10 @@ def test_redact_github_fine_grained_pat_negative_prose():
 
 
 def test_redact_slack_bot_token():
-    fake_token = "xoxb-1234567890123-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+    # Letters in the numeric sections keep this matching OUR pattern while
+    # never matching Slack's real token format — GitHub push protection
+    # flagged the previous digits-only shape as a live Slack token.
+    fake_token = "xoxb-FAKE0FAKE0-TEST0TEST0-NotARealSlackToken00"
     text = f"SLACK_BOT_TOKEN={fake_token}"
     redacted, counts = redact_secrets(text)
     assert fake_token not in redacted
