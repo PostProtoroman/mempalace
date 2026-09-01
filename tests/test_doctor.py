@@ -307,14 +307,14 @@ def test_identity_hygiene_flags_known_alias(collection, palace_path):
 # ── orchestration ─────────────────────────────────────────────────────
 
 
-def test_run_all_returns_seven_checks(tmp_dir, monkeypatch):
+def test_run_all_returns_eight_checks(tmp_dir, monkeypatch):
     monkeypatch.setattr(doctor.platform, "system", lambda: "Linux")
     results = doctor.run_all(
         os.path.join(tmp_dir, "palace"),
         backup_dest=os.path.join(tmp_dir, "backups"),
         sessions_root=os.path.join(tmp_dir, "sessions"),
     )
-    assert len(results) == 7
+    assert len(results) == 8
     assert {r.name for r in results} == set(doctor.CHECK_ORDER)
 
 
@@ -367,7 +367,7 @@ def test_cli_doctor_json_shape(tmp_dir, monkeypatch, capsys):
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert "results" in payload
-    assert len(payload["results"]) == 7
+    assert len(payload["results"]) == 8
     assert exc_info.value.code in (0, 1)
 
 
@@ -390,3 +390,56 @@ def test_cli_doctor_table_output(tmp_dir, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "mempalace doctor" in out
+
+
+class TestUpstreamDrift:
+    def test_skips_without_git_checkout(self, tmp_path):
+        from mempalace.doctor import check_upstream_drift
+
+        r = check_upstream_drift(checkout=str(tmp_path))
+        assert r.status == "ok"
+        assert "skipped" in r.reason
+
+    def test_skips_without_upstream_remote(self, tmp_path):
+        import subprocess
+
+        from mempalace.doctor import check_upstream_drift
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        r = check_upstream_drift(checkout=str(tmp_path))
+        assert r.status == "ok"
+        assert "skipped" in r.reason
+
+    def test_warns_when_behind_fetched_upstream(self, tmp_path):
+        import subprocess
+
+        from mempalace.doctor import check_upstream_drift
+
+        def g(*args):
+            subprocess.run(
+                ["git", "-C", str(tmp_path), *args],
+                check=True,
+                capture_output=True,
+                env={
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@t",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
+
+        g("init", "-q", "-b", "main", ".")
+        (tmp_path / "a").write_text("1")
+        g("add", "a")
+        g("commit", "-qm", "one")
+        g("remote", "add", "upstream", str(tmp_path))
+        # simulate a fetched upstream/develop that is ahead
+        (tmp_path / "a").write_text("2")
+        g("add", "a")
+        g("commit", "-qm", "two")
+        g("update-ref", "refs/remotes/upstream/develop", "HEAD")
+        g("reset", "-q", "--hard", "HEAD~1")
+        r = check_upstream_drift(checkout=str(tmp_path))
+        assert r.status == "warn"
+        assert "1 commit(s) behind" in r.reason

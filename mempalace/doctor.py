@@ -556,7 +556,53 @@ CHECK_ORDER = (
     "search_health",
     "kg_unification",
     "identity_hygiene",
+    "upstream_drift",
 )
+
+
+def check_upstream_drift(checkout: "str | None" = None) -> CheckResult:
+    """How far the deployed checkout has drifted from the upstream remote.
+
+    Informational by design: behind-upstream is a WARN naming the update
+    runbook, never a FAIL — updates here are supervised (live deployment,
+    version-guarded services), and this check exists so drift is visible in
+    the same place as every other health signal. Skips cleanly when there
+    is no git checkout or no ``upstream`` remote.
+    """
+    import subprocess
+
+    name = "upstream_drift"
+    root = checkout or _canonical_checkout_root()
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        return _ok(name, "no git checkout to compare (skipped)")
+    try:
+        remotes = subprocess.run(
+            ["git", "-C", root, "remote"], capture_output=True, text=True, timeout=10
+        ).stdout.split()
+        if "upstream" not in remotes:
+            return _ok(name, "no 'upstream' remote configured (skipped)")
+        # Compare against the last *fetched* state — doctor must stay fast
+        # and offline; refreshing the ref is the update runbook's job.
+        behind = subprocess.run(
+            ["git", "-C", root, "rev-list", "--count", "HEAD..upstream/develop"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if behind.returncode != 0:
+            return _ok(name, "upstream/develop not fetched yet (skipped)")
+        n = int(behind.stdout.strip() or "0")
+        if n == 0:
+            return _ok(name, "checkout is up to date with last-fetched upstream/develop")
+        return _warn(
+            name,
+            f"checkout is {n} commit(s) behind last-fetched upstream/develop",
+            "run the update runbook: git fetch upstream && merge the release tag, "
+            "test, restart services",
+            behind=n,
+        )
+    except Exception as exc:  # noqa: BLE001 - doctor checks never raise
+        return _exc_result(name, exc, "run `git fetch upstream` by hand to inspect")
 
 
 def run_all(
@@ -576,6 +622,7 @@ def run_all(
         check_search_health(palace_path),
         check_kg_unification(palace_path),
         check_identity_hygiene(palace_path),
+        check_upstream_drift(),
     ]
 
 
