@@ -4122,6 +4122,8 @@ def main():
     p_restore.add_argument("archive", help="Path to the mempalace-<timestamp>.tar.gz archive")
     p_restore.add_argument(
         "--target", required=True, help="Empty or nonexistent directory to restore into"
+    )
+
     # kg-migrate
     p_kg_migrate = sub.add_parser(
         "kg-migrate",

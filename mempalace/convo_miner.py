@@ -849,7 +849,8 @@ def _file_chunks_locked(
             batch_ids = [drawer_id for drawer_id, _, _ in batch]
             batch_docs = [content for _, content, _ in batch]
             batch_metas = [meta for _, _, meta in batch]
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)            try:
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+            try:
                 collection.upsert(
                     documents=batch_docs,
                     ids=batch_ids,
@@ -1378,7 +1379,12 @@ def _mine_convos_impl(
         _validate_palace_fts5_after_mine(palace_path)
 
     _print_mine_summary(
-        files_processed, files_skipped, files_quarantined, total_drawers, room_counts
+        files_processed,
+        files_skipped,
+        files_quarantined,
+        total_drawers,
+        room_counts,
+        redaction_counts,
     )
 
 
@@ -1388,6 +1394,7 @@ def _print_mine_summary(
     files_quarantined: int,
     total_drawers: int,
     room_counts: dict,
+    redaction_counts: dict,
 ) -> None:
     """Render the end-of-mine summary block."""
     print(f"\n{'=' * 55}")
