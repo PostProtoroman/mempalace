@@ -1147,3 +1147,33 @@ def test_long_tail_still_emitted_separately():
     body = "a" * 100 + "b" * 50
     _emit_bounded(chunks, body, chunk_size=100, min_chunk_size=30)
     assert [c["content"] for c in chunks] == ["a" * 100, "b" * 50]
+
+
+def test_split_prefers_word_boundaries():
+    """Oversize splits cut at paragraph/newline/space boundaries within the
+    lookback window — never mid-word — and concatenation reproduces the
+    input byte-for-byte."""
+    words = ("alpha beta gamma delta " * 20).strip()
+    chunks = []
+    _emit_bounded(chunks, words, chunk_size=100, min_chunk_size=10)
+    assert "".join(c["content"] for c in chunks) == words
+    for c in chunks[:-1]:
+        assert c["content"].endswith(" "), repr(c["content"][-15:])
+    for c in chunks[1:]:
+        assert not c["content"].startswith(" ")
+
+
+def test_split_prefers_paragraph_break_over_space():
+    body = "a" * 80 + "\n\n" + "b" * 60
+    chunks = []
+    _emit_bounded(chunks, body, chunk_size=100, min_chunk_size=10)
+    assert chunks[0]["content"] == "a" * 80 + "\n\n"
+    assert chunks[1]["content"] == "b" * 60
+
+
+def test_split_boundary_free_window_falls_back_to_hard_cut():
+    body = "x" * 250
+    chunks = []
+    _emit_bounded(chunks, body, chunk_size=100, min_chunk_size=10)
+    assert [len(c["content"]) for c in chunks] == [100, 100, 50]
+    assert "".join(c["content"] for c in chunks) == body

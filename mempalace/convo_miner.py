@@ -207,7 +207,7 @@ CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 #                  (assistant text after a markdown rule was discarded)
 #                  and stopped dropping exchanges at or below
 #                  MIN_CHUNK_SIZE (short decisions vanished).
-CONVO_CHUNKER_VERSION = 2
+CONVO_CHUNKER_VERSION = 3
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
@@ -454,13 +454,36 @@ def _emit_bounded(
     """
     if not content.strip():
         return
-    slices = [content[i : i + chunk_size] for i in range(0, len(content), chunk_size)]
-    # A short trailing slice of a *split* message is an orphan fragment, not
-    # a standalone memory — filed alone it surfaces in search as mid-word
-    # noise ("ция нетронута…"). Fold it into the previous slice instead:
-    # nothing is lost, and the last chunk may exceed chunk_size by less
-    # than min_chunk_size. A short *whole* message (single slice) is still
-    # kept as-is — that is the decision class the floor used to eat.
+    # Split at natural boundaries, not raw byte offsets: a hard cut at
+    # chunk_size strands mid-word fragments ("…опера|ция нетронута…") as
+    # their own drawers, which then surface in search as noise. Within a
+    # lookback window before the cap we prefer the last paragraph break,
+    # then the last newline, then the last space; only a boundary-free
+    # window falls back to the hard cut. Concatenating the slices always
+    # reproduces the input byte-for-byte — verbatim is preserved, only
+    # the packaging changes.
+    lookback = max(min_chunk_size, chunk_size // 4)
+    slices = []
+    pos = 0
+    while pos < len(content):
+        window = content[pos : pos + chunk_size]
+        if pos + chunk_size >= len(content):
+            slices.append(window)
+            break
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            found = window.rfind(sep, chunk_size - lookback)
+            if found != -1:
+                cut = found + len(sep)
+                break
+        if cut <= 0:
+            cut = chunk_size
+        slices.append(content[pos : pos + cut])
+        pos += cut
+    # A sub-minimum trailing slice folds into its predecessor: nothing is
+    # lost, and no orphan tail drawer exists. A short *whole* message
+    # (single slice) stays standalone — that is the decision class the
+    # old floor used to eat.
     if len(slices) > 1 and len(slices[-1].strip()) < min_chunk_size:
         tail = slices.pop()
         slices[-1] += tail
