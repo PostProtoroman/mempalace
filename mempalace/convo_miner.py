@@ -30,6 +30,7 @@ from .ids import (
 )
 from .normalize import normalize_conversations
 from .entities import entities_metadata
+from .redact import print_redaction_summary, redact_if_enabled
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -48,6 +49,22 @@ logger = logging.getLogger("mempalace_mcp")
 
 # Cached hall keywords — avoids re-reading config per drawer
 _HALL_KEYWORDS_CACHE = None
+
+# Cached redaction.enabled — same rationale as _HALL_KEYWORDS_CACHE: this
+# module has no palace_path to scope a per-palace config read against for
+# file_conversation_exchange (it only receives an already-open collection),
+# and that path can be called once per live conversation turn.
+_REDACTION_ENABLED_CACHE = None
+
+
+def _redaction_enabled_cached() -> bool:
+    """Read config.redaction.enabled once per process. See _detect_hall_cached."""
+    global _REDACTION_ENABLED_CACHE
+    if _REDACTION_ENABLED_CACHE is None:
+        from .config import MempalaceConfig
+
+        _REDACTION_ENABLED_CACHE = MempalaceConfig().redaction_enabled
+    return _REDACTION_ENABLED_CACHE
 
 
 def _detect_hall_cached(content: str) -> str:
@@ -98,12 +115,29 @@ def file_conversation_exchange(
     canonical fields are ignored, so it cannot be used to overwrite or
     drop them. Returns the drawer id, or None when ``text`` is empty
     after stripping.
+
+    ``text`` is passed through ``redact_secrets`` before anything else
+    touches it (hall detection, entity extraction, ID derivation, and the
+    stored document itself all see the redacted form) unless
+    ``config.redaction.enabled`` is set to false. This is the one
+    deliberate exception to the verbatim-storage promise above — see
+    ``mempalace/redact.py`` for why. Redactions are never silent: when any
+    are made, they're logged at info level with the kind counts.
     """
     from .config import sanitize_name
 
     text = (text or "").strip()
     if not text:
         return None
+    redaction_counts: dict = {}
+    text = redact_if_enabled(text, _redaction_enabled_cached(), redaction_counts)
+    if redaction_counts:
+        logger.info(
+            "file_conversation_exchange: redacted %d secret(s) from %r: %s",
+            sum(redaction_counts.values()),
+            source_file,
+            redaction_counts,
+        )
     try:
         wing = sanitize_name(wing, "wing")
     except ValueError:
@@ -1086,6 +1120,7 @@ def _mine_convos_impl(
     # chunk_exchanges and abort convo ingest.
     explicit_min = palace_config.min_chunk_size_explicit
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
+    cfg_redaction_enabled = palace_config.redaction_enabled
 
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
@@ -1134,6 +1169,7 @@ def _mine_convos_impl(
     files_skipped = 0
     files_processed = 0
     room_counts = defaultdict(int)
+    redaction_counts: dict = {}
 
     for i, filepath in enumerate(files, 1):
         files_processed = i
@@ -1191,6 +1227,14 @@ def _mine_convos_impl(
 
         content = "\n\n".join(text for _, text in new_items)
         content_hash = ",".join(h for h, _ in new_items)
+
+        # Redact before chunking so every chunk this file produces —
+        # exchange-pair or general-extractor alike — is already scrubbed by
+        # the time it reaches a batch upsert. content_hash above is
+        # unaffected: it dedups on the ORIGINAL per-conversation text
+        # (computed from new_items, not from content), which is fine since
+        # only the hash is stored, never the text it was made from.
+        content = redact_if_enabled(content, cfg_redaction_enabled, redaction_counts)
 
         # Chunk — either exchange pairs or general extraction
         if extract_mode == "general":
@@ -1279,6 +1323,7 @@ def _mine_convos_impl(
     print(f"  Files processed: {files_processed - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    print_redaction_summary(redaction_counts)
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):

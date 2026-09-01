@@ -1432,6 +1432,22 @@ class MempalaceConfig:
         return "en"
 
     @property
+    def redaction_enabled(self):
+        """Whether ingest-time secret redaction runs before drawer content is stored.
+
+        Kill switch for ``redact.redact_secrets`` (see ``mempalace/redact.py``).
+        Default True — redaction is a safety default, not an opt-in, since
+        the miners are the path that put API keys, AWS key IDs, and JWTs into
+        a live palace verbatim. Set to False only for a deliberate,
+        documented reason (e.g. reproducing pre-redaction behavior).
+        """
+        env_val = os.environ.get("MEMPALACE_REDACTION_ENABLED")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        redaction = self._file_config.get("redaction", {})
+        return redaction.get("enabled", True)
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
