@@ -71,21 +71,50 @@ codex /init
 ## Capturing conversations
 
 Codex's plugin manifest supports skills and MCP servers, but not lifecycle
-hooks — so this plugin cannot auto-save turns as they happen. Capture works
-by mining the session transcripts Codex already writes to disk:
+hooks — this plugin's own `hooks.json` (shipped in this directory) cannot be
+referenced by any supported manifest field, so installing the plugin alone
+does not auto-save turns. There are two real capture paths:
+
+### 1. Follower service (primary)
+
+A background service tails `~/.codex/sessions` continuously and files new
+turns as they land, independent of whether Codex is even running. Install it
+via the launchd unit in `deploy/launchd/` (see `deploy/launchd/README.md`),
+or run it in the foreground / once:
 
 ```bash
-mempalace mine ~/.codex
+mempalace codex-capture           # follow continuously
+mempalace codex-capture --once    # one pass, then exit
+mempalace codex-capture --backfill --dry-run   # preview importing existing history
 ```
 
-or `/mine` from inside Codex. Mining is incremental — re-running it picks up
-new sessions without duplicating what is already filed. Both the legacy
+Capture is incremental — re-running picks up new sessions without
+duplicating what is already filed. Both the legacy
 (`user_message`/`agent_message`) and current (`item_completed`, Codex
->= 0.149) transcript formats are supported.
+>= 0.149) transcript formats are supported. Check status with
+`mempalace codex-status`.
 
-A `hooks.json` and hook scripts ship in this directory for the day Codex's
-plugin schema gains lifecycle hooks; today no supported manifest field can
-reference them, and they are not active after installation.
+### 2. Global hooks.json (safety net)
+
+Codex's *global* `~/.codex/hooks.json` (distinct from this plugin's
+manifest) does support lifecycle hooks. As a safety net for when the
+follower service isn't running, wire Stop and PreCompact there:
+
+```bash
+mempalace codex-hooks-install          # print the exact file content + where it goes
+mempalace codex-hooks-install --apply  # write it — only if no hooks.json exists yet
+```
+
+This never overwrites an existing `~/.codex/hooks.json` — if one is already
+there, the command prints a merge hint instead so you can add the
+MemPalace entries by hand alongside whatever you already have.
+
+## Recall
+
+The `recall` skill (`skills/recall/SKILL.md`) makes Codex search the palace
+before answering about prior work, people, or decisions, instead of
+guessing. It mirrors the policy installed into `~/.codex/AGENTS.md` by
+`mempalace codex-recall install`.
 
 ## Support
 

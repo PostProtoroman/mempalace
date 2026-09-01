@@ -1424,6 +1424,33 @@ def cmd_codex_recall(args):
     return 1
 
 
+def cmd_codex_hooks_install(args):
+    """Print, or with --apply write, the global ~/.codex/hooks.json safety net."""
+    from . import codex_hooks_install
+
+    result = codex_hooks_install.install(args.hooks_file, apply=bool(args.apply))
+
+    if result["existed"]:
+        print(f"  {result['path']} already exists — NOT overwritten.")
+        print()
+        print(result["merge_hint"])
+        return 0
+
+    if result["written"]:
+        print(f"  Wrote {result['path']}")
+        print()
+        print(result["content"])
+        return 0
+
+    print(f"  Would write {result['path']} (dry run — pass --apply to write it):")
+    print()
+    print(result["content"])
+    print("  This wires Codex's Stop and PreCompact lifecycle hooks to")
+    print("  'mempalace hook run --hook <name> --harness codex' — a safety net")
+    print("  for when the follower service (deploy/launchd) isn't running.")
+    return 0
+
+
 def cmd_codex_status(args):
     """Show whether Codex capture is ACTIVE, DEGRADED, or BLOCKED."""
     from . import codex_recall, codex_service
@@ -3921,6 +3948,20 @@ def main():
     p_codex_status.add_argument("--home", default=None, help="Override HOME (testing)")
     p_codex_status.set_defaults(func=cmd_codex_status)
 
+    p_codex_hooks = sub.add_parser(
+        "codex-hooks-install",
+        help="Print (or write) the global ~/.codex/hooks.json safety-net hooks",
+    )
+    p_codex_hooks.add_argument(
+        "--hooks-file", default="~/.codex/hooks.json", help="Codex global hooks file"
+    )
+    p_codex_hooks.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the file, but only when none exists yet (never overwrites)",
+    )
+    p_codex_hooks.set_defaults(func=cmd_codex_hooks_install)
+
     p_codex_svc = sub.add_parser(
         "codex-service", help="Run Codex capture as a background login service"
     )
@@ -4795,6 +4836,7 @@ def main():
         "sweep": cmd_sweep,
         "codex-capture": cmd_codex_capture,
         "codex-status": cmd_codex_status,
+        "codex-hooks-install": cmd_codex_hooks_install,
         "codex-service": cmd_codex_service,
         "codex-recall": cmd_codex_recall,
         "sync": cmd_sync,
