@@ -43,6 +43,41 @@ def test_convo_mining():
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_convos_end_to_end_redacts_secret_and_reports_summary(monkeypatch, capsys):
+    """Full mine_convos() pipeline: a secret pasted mid-transcript must not
+    reach the palace verbatim, and the summary must report the redaction
+    rather than scrubbing silently."""
+    monkeypatch.setenv("MEMPALACE_REDACTION_ENABLED", "true")
+
+    fake_key = "sk-ant-api03-AbCdEfGh12345678901234567890ijklMNOPqrstUVWXyz9876"
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(tmpdir, "chat.txt"), "w") as f:
+            f.write(
+                "> Can you check my key?\n"
+                f"Sure, I see it: {fake_key} -- looks well-formed.\n\n"
+                "> Thanks, what's next?\n"
+                "Rotate it once you've confirmed it works.\n\n"
+                "> Will do, anything else?\n"
+                "That covers it for now.\n"
+            )
+
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test_convos_redact")
+
+        out = capsys.readouterr().out
+        assert "Secrets redacted:" in out
+        assert "anthropic_key:" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        stored = col.get(include=["documents"])["documents"]
+        assert not any(fake_key in doc for doc in stored)
+        assert any("[redacted:anthropic_key]" in doc for doc in stored)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_does_not_reprocess_short_files(capsys):
     """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
@@ -977,6 +1012,64 @@ def test_file_conversation_exchange_invalid_room_falls_back_to_conversations():
     file_conversation_exchange(col, **_exchange_kwargs(room="a/b"))
     meta = col.upserts[0]["metadatas"][0]
     assert meta["room"] == "conversations"
+
+
+# ---------------------------------------------------------------------------
+# file_conversation_exchange — ingest-time secret redaction wiring
+# ---------------------------------------------------------------------------
+
+_FAKE_ANTHROPIC_KEY = "sk-ant-api03-AbCdEfGh12345678901234567890ijklMNOPqrstUVWXyz9876"
+
+
+def test_file_conversation_exchange_redacts_secret_before_storing(monkeypatch, caplog):
+    """The secret must not reach ``collection.upsert`` — not in the stored
+    document, and (since redaction runs before ID derivation and entity
+    extraction) nowhere else downstream either."""
+    import logging
+
+    import mempalace.convo_miner as convo_miner_mod
+    from mempalace.convo_miner import file_conversation_exchange
+
+    monkeypatch.setattr(convo_miner_mod, "_REDACTION_ENABLED_CACHE", True)
+    col = _RecordingCollection()
+    text = f"User: here's my key\n\nAssistant: {_FAKE_ANTHROPIC_KEY} noted, thanks"
+
+    with caplog.at_level(logging.INFO, logger="mempalace_mcp"):
+        drawer_id = file_conversation_exchange(col, **_exchange_kwargs(text=text))
+
+    assert drawer_id is not None
+    stored_doc = col.upserts[0]["documents"][0]
+    assert _FAKE_ANTHROPIC_KEY not in stored_doc
+    assert "[redacted:anthropic_key]" in stored_doc
+    # Redaction must never be silent.
+    assert any("redacted" in rec.message for rec in caplog.records)
+
+
+def test_file_conversation_exchange_redact_disabled_stores_verbatim(monkeypatch):
+    import mempalace.convo_miner as convo_miner_mod
+    from mempalace.convo_miner import file_conversation_exchange
+
+    monkeypatch.setattr(convo_miner_mod, "_REDACTION_ENABLED_CACHE", False)
+    col = _RecordingCollection()
+    text = f"User: here's my key\n\nAssistant: {_FAKE_ANTHROPIC_KEY} noted, thanks"
+
+    file_conversation_exchange(col, **_exchange_kwargs(text=text))
+
+    assert _FAKE_ANTHROPIC_KEY in col.upserts[0]["documents"][0]
+
+
+def test_file_conversation_exchange_plain_exchange_unaffected(monkeypatch):
+    """Negative case: ordinary conversation text survives byte-identical."""
+    import mempalace.convo_miner as convo_miner_mod
+    from mempalace.convo_miner import file_conversation_exchange
+
+    monkeypatch.setattr(convo_miner_mod, "_REDACTION_ENABLED_CACHE", True)
+    col = _RecordingCollection()
+    text = "User: hi\n\nAssistant: hello"
+
+    file_conversation_exchange(col, **_exchange_kwargs(text=text))
+
+    assert col.upserts[0]["documents"] == [text]
 
 
 def _write_dry_run_transcript(path: Path) -> None:

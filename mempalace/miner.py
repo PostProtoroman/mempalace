@@ -46,6 +46,7 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .redact import print_redaction_summary, redact_if_enabled
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -189,6 +190,44 @@ SKIP_FILENAMES = {
     "pnpm-lock.yaml",
     "yarn.lock",
 }
+
+# Credential/secret filename patterns — always skipped during project
+# mining, unlike SKIP_FILENAMES above. 'auth.json' under ~/.codex is what
+# prompted this: `mempalace mine ~/.codex` (project mode) would otherwise
+# walk straight into a live OAuth credential file and store it verbatim.
+# fnmatch-style, matched case-insensitively against the bare filename in
+# ``_is_credential_filename``.
+CREDENTIAL_FILENAME_PATTERNS = (
+    "auth.json",
+    "credentials.json",
+    "credentials",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "*.p12",
+    "*.pfx",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+)
+
+
+def _is_credential_filename(filename: str) -> bool:
+    """True when ``filename`` matches a known credential/secret file pattern.
+
+    Case-insensitive match against ``CREDENTIAL_FILENAME_PATTERNS``. This
+    blocklist is intentionally NOT bypassable via ``--include-ignored`` /
+    force-include the way ``SKIP_FILENAMES`` is: a credential file must
+    never enter the palace even when a user explicitly tries to force it
+    in (see ``scan_project``, where this check runs before force-include
+    is consulted).
+    """
+    lowered = filename.lower()
+    return any(fnmatch.fnmatch(lowered, pattern) for pattern in CREDENTIAL_FILENAME_PATTERNS)
+
 
 # Re-export the shared defaults from ``config`` so legacy callers that
 # import ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` from
@@ -1502,6 +1541,8 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    redact_enabled: bool = True,
+    redaction_counts: Optional[dict] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1511,8 +1552,20 @@ def process_file(
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
     surface a separate counter in the mine summary (see #1455).
+
+    When ``redact_enabled`` (default True — see
+    ``MempalaceConfig.redaction_enabled``), the file's content runs through
+    ``redact_secrets`` once, in full, before chunking — so every chunk this
+    file produces is already scrubbed, and so is the raw window
+    ``build_closet_lines`` below extracts quotes/entities from. Per-kind
+    match counts accumulate into the caller-supplied ``redaction_counts``
+    dict (mutated in place, matching the mine summary's existing mutable-
+    accumulator style) so a redaction is never silent even though this
+    function's own return tuple doesn't change shape.
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
+    if redaction_counts is None:
+        redaction_counts = {}
 
     # Skip if already filed
     source_file = str(filepath)
@@ -1527,6 +1580,8 @@ def process_file(
     content = content.strip()
     if len(content) < effective_min:
         return 0, "general", None
+
+    content = redact_if_enabled(content, redact_enabled, redaction_counts)
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(
@@ -1768,6 +1823,13 @@ def scan_project(
 
         for filename in filenames:
             filepath = root_path / filename
+
+            # Unconditional — checked before force_include is even consulted,
+            # so a credential file can never be smuggled in via
+            # --include-ignored. See CREDENTIAL_FILENAME_PATTERNS.
+            if _is_credential_filename(filename):
+                continue
+
             force_include = is_force_included(filepath, project_path, include_paths)
             exact_force_include = is_exact_force_include(filepath, project_path, include_paths)
 
@@ -1919,6 +1981,7 @@ def _mine_impl(
     cfg_chunk_size = palace_config.chunk_size
     cfg_chunk_overlap = palace_config.chunk_overlap
     cfg_min_chunk_size = palace_config.min_chunk_size
+    cfg_redaction_enabled = palace_config.redaction_enabled
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
@@ -1969,6 +2032,7 @@ def _mine_impl(
     files_processed = 0
     last_file = None
     room_counts = defaultdict(int)
+    redaction_counts: dict = {}
     effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
 
     try:
@@ -1991,6 +2055,8 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    redact_enabled=cfg_redaction_enabled,
+                    redaction_counts=redaction_counts,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -2095,6 +2161,7 @@ def _mine_impl(
                 f"set 0 to disable)"
             )
         print(f"  Drawers filed: {total_drawers}")
+        print_redaction_summary(redaction_counts)
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
             print(f"    {room:20} {count} files")

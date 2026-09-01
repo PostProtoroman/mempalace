@@ -1202,6 +1202,145 @@ def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_c
         assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
 
 
+# --- ingest-time secret redaction wiring (process_file) -----------------
+
+
+class _RedactionFakeCol:
+    """Minimal chroma-like collection that records every upserted document
+    so redaction tests can assert on exactly what would have been stored."""
+
+    def __init__(self):
+        self.documents: list = []
+        self.metadatas: list = []
+
+    def get(self, *args, **kwargs):
+        return {"ids": []}
+
+    def delete(self, *args, **kwargs):
+        pass
+
+    def upsert(self, documents, ids, metadatas):
+        self.documents.extend(documents)
+        self.metadatas.extend(metadatas)
+
+
+def test_process_file_redacts_secret_before_storing(tmp_path):
+    from mempalace import miner
+
+    fake_key = "sk-ant-api03-AbCdEfGh12345678901234567890ijklMNOPqrstUVWXyz9876"
+    source = tmp_path / "notes.md"
+    source.write_text(
+        f"Setup notes for the deploy.\nANTHROPIC_API_KEY={fake_key}\nDone for now.\n",
+        encoding="utf-8",
+    )
+    col = _RedactionFakeCol()
+    redaction_counts: dict = {}
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        redaction_counts=redaction_counts,
+    )
+
+    assert drawers >= 1
+    assert skip_reason is None
+    assert not any(fake_key in doc for doc in col.documents), (
+        "the raw secret must never reach collection.upsert"
+    )
+    assert any("[redacted:anthropic_key]" in doc for doc in col.documents)
+    assert redaction_counts == {"anthropic_key": 1}
+
+
+def test_process_file_redact_disabled_stores_verbatim(tmp_path):
+    """redact_enabled=False (the redaction.enabled kill switch) must fall
+    back to byte-identical verbatim storage — the default MemPalace
+    promise — with zero redaction counts reported."""
+    from mempalace import miner
+
+    fake_key = "sk-ant-api03-AbCdEfGh12345678901234567890ijklMNOPqrstUVWXyz9876"
+    source = tmp_path / "notes.md"
+    source.write_text(
+        f"Setup notes for the deploy.\nANTHROPIC_API_KEY={fake_key}\nDone for now.\n",
+        encoding="utf-8",
+    )
+    col = _RedactionFakeCol()
+    redaction_counts: dict = {}
+
+    miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        redact_enabled=False,
+        redaction_counts=redaction_counts,
+    )
+
+    assert any(fake_key in doc for doc in col.documents)
+    assert redaction_counts == {}
+
+
+def test_process_file_no_secrets_present_counts_stay_empty(tmp_path):
+    """Negative case: ordinary content must not accumulate spurious counts
+    or otherwise be mangled by the redaction pass."""
+    from mempalace import miner
+
+    source = tmp_path / "notes.md"
+    text = "Plain deploy notes with nothing secret-shaped in them at all.\n" * 3
+    source.write_text(text, encoding="utf-8")
+    col = _RedactionFakeCol()
+    redaction_counts: dict = {}
+
+    miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        redaction_counts=redaction_counts,
+    )
+
+    assert redaction_counts == {}
+    assert "".join(col.documents) in text  # every stored chunk is a verbatim substring
+
+
+def test_mine_end_to_end_redacts_secret_and_reports_summary(tmp_path, monkeypatch, capsys):
+    """Full mine() pipeline: a secret written to a real project file must
+    not reach the palace verbatim, and the mine summary must surface the
+    redaction count rather than scrubbing silently."""
+    monkeypatch.setenv("MEMPALACE_REDACTION_ENABLED", "true")
+
+    fake_key = "AKIAIOSFODNN7EXAMPLE"
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    write_file(
+        project_root / "deploy_notes.md",
+        f"Deploy notes.\naws_access_key_id = {fake_key}\nMore deploy notes below.\n" * 3,
+    )
+    palace_path = project_root / "palace"
+
+    mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Secrets redacted:" in out
+    assert "aws_access_key_id:" in out
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    stored = col.get(include=["documents"])["documents"]
+    assert not any(fake_key in doc for doc in stored)
+    assert any("[redacted:aws_access_key_id]" in doc for doc in stored)
+
+
 def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     from mempalace import miner
 
@@ -1957,6 +2096,86 @@ def test_skip_filenames_includes_lockfiles():
     assert "package-lock.json" in miner.SKIP_FILENAMES
     assert "pnpm-lock.yaml" in miner.SKIP_FILENAMES
     assert "yarn.lock" in miner.SKIP_FILENAMES
+
+
+# --- credential filename blocklist (#background: mempalace mine ~/.codex
+# in project mode would ingest auth.json) ------------------------------
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "auth.json",
+        "AUTH.JSON",  # case-insensitive
+        "credentials.json",
+        "credentials",
+        ".env",
+        ".env.local",
+        ".env.production",
+        "server.pem",
+        "private.key",
+        "id_rsa",
+        "id_rsa.pub",
+        "id_ed25519",
+        "id_ed25519.pub",
+        "client.p12",
+        "client.pfx",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+    ],
+)
+def test_is_credential_filename_matches_known_patterns(filename):
+    from mempalace.miner import _is_credential_filename
+
+    assert _is_credential_filename(filename) is True
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "main.py",
+        "README.md",
+        "environment.py",  # must not fuzzy-match ".env"
+        "credentials_notes.md",  # not an exact "credentials" match
+        "keynote.txt",  # must not fuzzy-match "*.key"
+        "package.json",
+    ],
+)
+def test_is_credential_filename_does_not_match_ordinary_files(filename):
+    from mempalace.miner import _is_credential_filename
+
+    assert _is_credential_filename(filename) is False
+
+
+def test_scan_project_skips_credential_files(tmp_path):
+    write_file(tmp_path / "auth.json", '{"access_token": "should-never-be-mined"}')
+    write_file(tmp_path / ".env", "SECRET=should-never-be-mined")
+    write_file(tmp_path / "id_rsa", "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END-----")
+    write_file(tmp_path / ".npmrc", "//registry.npmjs.org/:_authToken=should-never-be-mined")
+    write_file(tmp_path / "app.py", "def main():\n    print('hello world')\n" * 5)
+
+    assert scanned_files(tmp_path) == ["app.py"]
+
+
+def test_scan_project_credential_skip_not_bypassable_via_include_ignored(tmp_path):
+    """CREDENTIAL_FILENAME_PATTERNS must win even when the user explicitly
+    force-includes the file with --include-ignored — unlike SKIP_FILENAMES,
+    this blocklist is unconditional (checked before force_include in
+    scan_project)."""
+    write_file(tmp_path / "auth.json", '{"access_token": "should-never-be-mined"}')
+
+    assert scanned_files(tmp_path, include_ignored=["auth.json"]) == []
+
+
+def test_process_file_skips_dot_env_via_scan_project_not_readable_extension(tmp_path):
+    """.env has no dot-suffix Python recognizes as an extension, so without
+    the credential blocklist it could slip past READABLE_EXTENSIONS
+    filtering entirely by accident. Confirms the blocklist path is actually
+    exercised for this filename shape, not accidentally already excluded."""
+    from mempalace.miner import READABLE_EXTENSIONS
+
+    assert Path(".env").suffix.lower() not in READABLE_EXTENSIONS
 
 
 def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch, capsys):

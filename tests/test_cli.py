@@ -675,6 +675,102 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
         assert call_kwargs["include_ignored"] == ["a.txt", "b.txt", "c.txt"]
 
 
+# ── cmd_mine: AI-tool-path mine guard (background: `mempalace mine
+# ~/.codex` in project mode would ingest auth.json credentials) ──────────
+
+
+@pytest.mark.parametrize(
+    "ai_tool_dir",
+    [
+        "/home/user/.codex",
+        "/home/user/.codex/sessions",
+        "/home/user/.gemini/tmp",
+        "/home/user/.claude/projects",
+        "/home/user/.claude/projects/-some-slug",
+    ],
+)
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_refuses_project_mode_on_ai_tool_path(mock_config_cls, ai_tool_dir, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir=ai_tool_dir,
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.miner.mine") as mock_mine:
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_mine(args)
+        assert exc_info.value.code == 2
+        mock_mine.assert_not_called()
+
+    err = capsys.readouterr().err
+    assert "refusing to mine" in err
+    assert "--mode convos" in err
+    assert ai_tool_dir in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_convos_mode_still_works_on_ai_tool_path(mock_config_cls):
+    """The guard only blocks project mode — `--mode convos` is the
+    documented, correct way to mine an AI tool's conversation storage and
+    must be unaffected."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/home/user/.codex",
+        palace=None,
+        mode="convos",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        include_subagents=False,
+    )
+    with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+        cmd_mine(args)
+        mock_mine.assert_called_once_with(
+            convo_dir="/home/user/.codex",
+            palace_path="/fake/palace",
+            wing=None,
+            agent="mempalace",
+            limit=0,
+            dry_run=False,
+            extract_mode="exchange",
+            include_subagents=False,
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_project_mode_ordinary_path_unaffected(mock_config_cls):
+    """Negative case: an ordinary project directory must mine normally —
+    the guard must not false-positive on unrelated dotted directory names."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/home/user/projects/myapp",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.miner.mine") as mock_mine:
+        cmd_mine(args)
+        mock_mine.assert_called_once()
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"

@@ -899,6 +899,66 @@ def test_hooks_auto_save_env_override_true():
         del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
 
 
+# --- redaction.enabled ---
+
+
+def test_redaction_enabled_default_is_true():
+    """Redaction is a safety default, not an opt-in — the miners are the
+    path that put API keys, AWS key IDs, and JWTs into a live palace
+    verbatim, so a fresh config with no explicit setting must redact."""
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.redaction_enabled is True
+
+
+def test_redaction_enabled_from_config_false():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"redaction": {"enabled": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.redaction_enabled is False
+
+
+def test_redaction_enabled_env_override_false():
+    os.environ["MEMPALACE_REDACTION_ENABLED"] = "false"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.redaction_enabled is False
+    finally:
+        del os.environ["MEMPALACE_REDACTION_ENABLED"]
+
+
+def test_redaction_enabled_env_override_zero():
+    os.environ["MEMPALACE_REDACTION_ENABLED"] = "0"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.redaction_enabled is False
+    finally:
+        del os.environ["MEMPALACE_REDACTION_ENABLED"]
+
+
+def test_redaction_enabled_env_override_no():
+    os.environ["MEMPALACE_REDACTION_ENABLED"] = "no"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.redaction_enabled is False
+    finally:
+        del os.environ["MEMPALACE_REDACTION_ENABLED"]
+
+
+def test_redaction_enabled_env_override_true_wins_over_config_false():
+    """Env var set to 'true' overrides config file even if config says false —
+    matches the hooks.auto_save precedence above."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"redaction": {"enabled": False}}, f)
+    os.environ["MEMPALACE_REDACTION_ENABLED"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.redaction_enabled is True
+    finally:
+        del os.environ["MEMPALACE_REDACTION_ENABLED"]
+
+
 def test_hook_use_daemon_default_false(monkeypatch):
     monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())

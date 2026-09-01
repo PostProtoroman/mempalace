@@ -956,6 +956,27 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
+    # Refuse project-mode mining of an AI tool's own conversation storage
+    # (.codex, .gemini, .claude/projects). Those trees hold live credential
+    # files (e.g. ~/.codex/auth.json) and full transcripts, not project
+    # files — `mempalace mine ~/.codex` in project mode would otherwise walk
+    # straight into auth.json and store it verbatim. Checked before the
+    # --daemon / --background dispatch below so a daemon-submitted job can't
+    # bypass it either. `--mode convos` is unaffected: that path already
+    # exists to mine exactly this kind of directory correctly.
+    if mode == "projects":
+        from .convo_miner import _is_ai_tool_path
+
+        if _is_ai_tool_path(Path(os.path.expanduser(args.dir))):
+            print(
+                f"mempalace: refusing to mine {args.dir!r} in project mode -- it is an AI "
+                "tool's conversation storage directory (.codex / .gemini / .claude/projects), "
+                "which holds live credentials and full transcripts, not project files.\n"
+                f"  Use instead: mempalace mine {shlex.quote(args.dir)} --mode convos",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     if getattr(args, "background", False) and not getattr(args, "daemon", False):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
