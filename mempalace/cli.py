@@ -1264,6 +1264,7 @@ def cmd_codex_capture(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
     backfill = bool(getattr(args, "backfill", False))
+    include_automation = bool(getattr(args, "include_automation", False))
 
     print(f"  Palace:         {palace_path}")
     print(f"  Codex sessions: {os.path.expanduser(sessions_root)}")
@@ -1309,7 +1310,9 @@ def cmd_codex_capture(args):
         )
 
     if args.once:
-        stats = run_once(palace_path, sessions_root, backfill=backfill)
+        stats = run_once(
+            palace_path, sessions_root, backfill=backfill, include_automation=include_automation
+        )
         if stats.get("error"):
             print(f"  Capture failed via {stats.get('writer')}: {stats['error']}", file=sys.stderr)
             return 1
@@ -1320,7 +1323,9 @@ def cmd_codex_capture(args):
         return 0
 
     print(f"  Following every {args.interval:.0f}s. Ctrl-C to stop.")
-    totals = follow(palace_path, sessions_root, interval=args.interval)
+    totals = follow(
+        palace_path, sessions_root, interval=args.interval, include_automation=include_automation
+    )
     print(f"  Stopped after {totals['passes']} pass(es): +{totals['drawers_added']} new drawers.")
     return 0
 
@@ -3541,6 +3546,12 @@ def main():
         "--backfill",
         action="store_true",
         help="Import turns that predate activation (default: only new turns)",
+    )
+    p_codex.add_argument(
+        "--include-automation",
+        action="store_true",
+        help="Also capture non-interactive `codex exec` sessions, routed to the "
+        "dedicated codex_automation wing (default: skipped)",
     )
     p_codex.add_argument(
         "--dry-run", action="store_true", help="With --backfill: report the plan, write nothing"

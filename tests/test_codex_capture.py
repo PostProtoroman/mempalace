@@ -278,6 +278,205 @@ def test_status_reports_stored_codex_turns(tmp_path):
     assert st["rollouts_on_disk"] == 1
 
 
+# ── routing guard: machine sessions never reach the user's wing ──────
+
+
+@pytest.mark.parametrize("thread_source", ["subagent", "guardian_review"])
+def test_machine_sessions_route_to_the_dedicated_wing(tmp_path, thread_source):
+    from mempalace.palace import get_collection
+    from mempalace.sources.codex import SUBAGENT_WING
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(
+        root,
+        "user",
+        [_meta(), _item("user", "u1", "my own question", 1)],
+    )
+    _write_rollout(
+        root,
+        "machine",
+        [
+            _meta(thread_id="t-mach", thread_source=thread_source, parent_thread_id="parent-7"),
+            _item("user", "m1", "delegated work", 1, thread_id="t-mach"),
+        ],
+    )
+
+    stats = scan_once(palace, str(root))
+    assert stats["drawers_added"] == 2
+    assert stats["subagent_turns_routed"] == 1
+
+    data = get_collection(palace, create=False).get(
+        where={"ingest_mode": "codex_session"}, include=["metadatas", "documents"]
+    )
+    by_doc = {d: m for d, m in zip(data["documents"], data["metadatas"])}
+    machine = next(m for d, m in by_doc.items() if "delegated work" in d)
+    user = next(m for d, m in by_doc.items() if "my own question" in d)
+    assert machine["wing"] == SUBAGENT_WING
+    assert machine["parent_thread_id"] == "parent-7"
+    assert user["wing"] != SUBAGENT_WING
+
+
+def test_automation_is_skipped_by_default_and_counted(tmp_path):
+    from mempalace.palace import get_collection
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(
+        root,
+        "auto",
+        [_meta(originator="codex_exec", source="exec"), _item("user", "x1", "machine run", 1)],
+    )
+
+    stats = scan_once(palace, str(root))
+    assert stats["drawers_added"] == 0
+    assert stats["files_automation_skipped"] == 1
+    assert stats["automation_turns_captured"] == 0
+    data = get_collection(palace, create=True).get(include=[])
+    assert (data.get("ids") or []) == []
+
+
+def test_automation_opt_in_routes_to_the_automation_wing(tmp_path):
+    from mempalace.palace import get_collection
+    from mempalace.sources.codex import AUTOMATION_WING
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(
+        root,
+        "auto",
+        [_meta(originator="codex_exec", source="exec"), _item("user", "x1", "machine run", 1)],
+    )
+
+    stats = scan_once(palace, str(root), include_automation=True)
+    assert stats["drawers_added"] == 1
+    assert stats["automation_turns_captured"] == 1
+    assert stats["files_automation_skipped"] == 0
+
+    meta = get_collection(palace, create=False).get(
+        where={"ingest_mode": "codex_session"}, include=["metadatas"]
+    )["metadatas"][0]
+    assert meta["wing"] == AUTOMATION_WING
+    assert meta["automation"] is True
+
+
+# ── no garbage fallthrough ───────────────────────────────────────────
+
+
+def test_unparseable_rollout_is_counted_warned_and_never_chunked(tmp_path, caplog):
+    import logging
+
+    from mempalace.palace import get_collection
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    garbage = _write_rollout(
+        root, "garbage", ["this is not json at all", "%%% neither is this line %%%"]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mempalace.codex_follower"):
+        stats = scan_once(palace, str(root))
+
+    assert stats["files_unparseable"] == 1
+    assert stats["drawers_added"] == 0
+    # Never degraded to raw-text chunking: the palace holds nothing at all.
+    assert (get_collection(palace, create=True).get(include=[]).get("ids") or []) == []
+    warned = [r for r in caplog.records if "unparseable rollout" in r.getMessage()]
+    assert warned and str(garbage) in warned[0].getMessage()
+
+
+def test_recognized_but_turnless_rollout_is_not_unparseable(tmp_path):
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(root, "metaonly", [_meta()])
+    stats = scan_once(palace, str(root))
+    assert stats["files_unparseable"] == 0
+
+
+def test_empty_rollout_is_not_unparseable(tmp_path):
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    day = root / "2026" / "08" / "31"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / "rollout-empty.jsonl").write_text("", encoding="utf-8")
+    stats = scan_once(palace, str(root))
+    assert stats["files_unparseable"] == 0
+
+
+# ── deterministic ids across resume and compaction ───────────────────
+
+
+def test_resume_replay_with_native_ids_adds_nothing_new(tmp_path):
+    """A resumed session re-emits earlier items (same thread id, same item
+    ids) in a fresh rollout file. Deterministic (thread, item) drawer ids
+    make the replay an upsert of existing rows — only the genuinely new
+    turn lands."""
+    from mempalace.palace import get_collection
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(
+        root,
+        "orig",
+        [
+            _meta(),
+            _item("user", "u1", "original question", 1),
+            _item("assistant", "a1", "answer", 2),
+        ],
+    )
+    assert scan_once(palace, str(root))["drawers_added"] == 2
+
+    _write_rollout(
+        root,
+        "resumed",
+        [
+            _meta(),
+            _item("user", "u1", "original question", 1),
+            _item("assistant", "a1", "answer", 2),
+            _item("user", "u2", "follow-up after resume", 3),
+        ],
+    )
+    stats = scan_once(palace, str(root))
+    assert stats["drawers_added"] == 1, stats
+    assert scan_once(palace, str(root))["drawers_added"] == 0
+
+    ids = get_collection(palace, create=False).get(include=[]).get("ids") or []
+    assert len(ids) == 3
+
+
+def test_compaction_and_continuation_stay_idempotent(tmp_path):
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    lines = [
+        _meta(),
+        _item("user", "u1", "before compaction", 1),
+        _item("assistant", "a1", "ok", 2),
+    ]
+    path = _write_rollout(root, "compact", lines)
+    assert scan_once(palace, str(root))["drawers_added"] == 2
+
+    compacted = json.dumps(
+        {
+            "type": "compacted",
+            "ordinal": 3,
+            "payload": {
+                "replacement_history": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "before compaction"}],
+                    }
+                ]
+            },
+        }
+    )
+    path.write_text(
+        "\n".join(lines + [compacted, _item("user", "u2", "after compaction", 4)]) + "\n",
+        encoding="utf-8",
+    )
+    assert scan_once(palace, str(root))["drawers_added"] == 1
+    assert scan_once(palace, str(root))["drawers_added"] == 0
+
+
 # ── acceptance ───────────────────────────────────────────────────────
 
 

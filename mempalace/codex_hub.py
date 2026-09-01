@@ -82,7 +82,12 @@ def hub_is_healthy(base_url: str, headers: dict) -> bool:
 
 
 def _call(
-    base_url: str, headers: dict, sessions_root: str, max_turns: int, backfill: bool = False
+    base_url: str,
+    headers: dict,
+    sessions_root: str,
+    max_turns: int,
+    backfill: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     body = json.dumps(
         {
@@ -95,6 +100,7 @@ def _call(
                     "sessions_root": sessions_root,
                     "max_turns": max_turns,
                     "backfill": backfill,
+                    "include_automation": include_automation,
                 },
             },
         }
@@ -128,7 +134,13 @@ def _call(
     raise HubRefused("hub response carried no capture result")
 
 
-def capture_via_hub(palace_path: str, sessions_root: str, *, backfill: bool = False) -> dict:
+def capture_via_hub(
+    palace_path: str,
+    sessions_root: str,
+    *,
+    backfill: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Run a full capture pass through the hub. Raises HubUnavailable/HubRefused."""
     target = hub_target(palace_path)
     if target is None:
@@ -141,20 +153,33 @@ def capture_via_hub(palace_path: str, sessions_root: str, *, backfill: bool = Fa
         "drawers_added": 0,
         "drawers_already_present": 0,
         "turns_skipped_by_cursor": 0,
+        "subagent_turns_routed": 0,
+        "automation_turns_captured": 0,
         "files_scanned": 0,
+        "files_automation_skipped": 0,
+        "files_unparseable": 0,
         "threads_seen": 0,
         "hub_calls": 0,
         "writer": "hub",
         "hub_url": base_url,
     }
     for _ in range(MAX_CALLS_PER_PASS):
-        stats = _call(base_url, headers, sessions_root, TURNS_PER_CALL, backfill)
+        stats = _call(
+            base_url, headers, sessions_root, TURNS_PER_CALL, backfill, include_automation
+        )
         if not stats.get("success", True):
             raise HubRefused(str(stats.get("error") or "hub capture failed"))
         totals["hub_calls"] += 1
-        for key in ("drawers_added", "drawers_already_present", "turns_skipped_by_cursor"):
+        for key in (
+            "drawers_added",
+            "drawers_already_present",
+            "turns_skipped_by_cursor",
+            "subagent_turns_routed",
+            "automation_turns_captured",
+        ):
             totals[key] += int(stats.get(key) or 0)
-        totals["files_scanned"] = int(stats.get("files_scanned") or 0)
+        for key in ("files_scanned", "files_automation_skipped", "files_unparseable"):
+            totals[key] = int(stats.get(key) or 0)
         totals["threads_seen"] = max(totals["threads_seen"], int(stats.get("threads_seen") or 0))
         if not stats.get("pending"):
             return totals

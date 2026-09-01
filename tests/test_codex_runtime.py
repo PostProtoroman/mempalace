@@ -282,6 +282,133 @@ def test_uninstall_is_safe_when_nothing_is_installed(tmp_path):
     assert result["removed"] == []
 
 
+# ── failure escalation: a silent outage is impossible ────────────────
+
+
+def _fail_stats(error="hub returned HTTP 500 Internal Server Error"):
+    return {
+        "writer": "hub",
+        "error": error,
+        "drawers_added": 0,
+        "drawers_already_present": 0,
+    }
+
+
+def _ok_stats():
+    return {"writer": "direct", "error": "", "drawers_added": 0, "drawers_already_present": 0}
+
+
+def _outage_events(palace):
+    import os
+
+    from mempalace.logstream import LOGSTREAM_DB_FILENAME, Logstream
+
+    ls = Logstream(db_path=os.path.join(palace, LOGSTREAM_DB_FILENAME))
+    return ls.list_events(type="status", from_agent="codex-follower")
+
+
+def _run_follow(palace, monkeypatch, results):
+    """Run follow() against a scripted sequence of capture_pass results."""
+    from mempalace.codex_follower import follow
+
+    queue = list(results)
+    monkeypatch.setattr("mempalace.codex_follower.capture_pass", lambda *a, **k: queue.pop(0))
+    return follow(palace, "unused-root", interval=0, max_passes=len(results))
+
+
+def test_consecutive_failures_escalate_to_error_and_one_event(tmp_path, monkeypatch, caplog):
+    import logging
+
+    palace = str(tmp_path / "palace")
+    with caplog.at_level(logging.ERROR, logger="mempalace.codex_follower"):
+        _run_follow(palace, monkeypatch, [_fail_stats()] * 6)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors, "threshold crossing must log at ERROR, not lower"
+    assert any("consecutive failed passes" in r.getMessage() for r in errors)
+
+    events = _outage_events(palace)
+    assert len(events) == 1, "one status event per outage, not per pass"
+    event = events[0]
+    assert event["to_agent"] == "*"
+    assert "mempalace_codex_capture" in event["body"]
+    assert "HTTP 500" in event["body"]
+
+
+def test_failures_below_threshold_do_not_announce(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    _run_follow(palace, monkeypatch, [_fail_stats()] * 3)
+    assert _outage_events(palace) == []
+
+
+def test_recovery_ends_the_outage_and_rearms_the_announcement(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    _run_follow(
+        palace,
+        monkeypatch,
+        [_fail_stats()] * 4 + [_ok_stats()] + [_fail_stats("hub gone again")] * 4,
+    )
+    events = _outage_events(palace)
+    assert len(events) == 2, "a second outage after recovery must announce again"
+    assert "gone again" in events[1]["body"]
+
+
+def test_status_surfaces_the_unhealthy_state(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    _run_follow(palace, monkeypatch, [_fail_stats()] * 4)
+    st = status(palace, str(tmp_path / "sessions"))
+    assert st["unhealthy"] is True
+    assert st["consecutive_failures"] == 4
+    assert st["state"] == "BLOCKED"
+
+
+def test_healthy_follower_reports_zero_consecutive_failures(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    _run_follow(palace, monkeypatch, [_ok_stats()] * 2)
+    st = status(palace, str(tmp_path / "sessions"))
+    assert st["unhealthy"] is False
+    assert st["consecutive_failures"] == 0
+
+
+# ── capture tool stats: routing guard is visible to the caller ───────
+
+
+def test_tool_reports_automation_and_subagent_counts(tmp_path, monkeypatch):
+    from mempalace import mcp_server
+
+    palace = str(tmp_path / "palace")
+    root = tmp_path / "sessions"
+    _write_rollout(root, "user", [_meta(), _item("user", "u1", "mine", 1)])
+    _write_rollout(
+        root,
+        "auto",
+        [_meta(originator="codex_exec", source="exec"), _item("user", "x1", "robot", 1)],
+    )
+    _write_rollout(
+        root,
+        "sub",
+        [
+            _meta(thread_id="t-sub", thread_source="subagent", parent_thread_id="p1"),
+            _item("user", "s1", "delegated", 1, thread_id="t-sub"),
+        ],
+    )
+    _write_rollout(root, "junk", ["not json", "also not json"])
+
+    monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": palace})())
+    result = mcp_server.tool_codex_capture(sessions_root=str(root))
+    assert result["success"] is True
+    assert result["drawers_added"] == 2
+    assert result["files_automation_skipped"] == 1
+    assert result["subagent_turns_routed"] == 1
+    assert result["files_unparseable"] == 1
+    assert result["automation_turns_captured"] == 0
+
+    opted = mcp_server.tool_codex_capture(sessions_root=str(root), include_automation=True)
+    assert opted["success"] is True
+    assert opted["automation_turns_captured"] == 1
+    assert opted["files_automation_skipped"] == 0
+
+
 # ── hub client parsing ───────────────────────────────────────────────
 
 

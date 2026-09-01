@@ -49,6 +49,12 @@ DEFAULT_SESSIONS_ROOT = os.path.join("~", ".codex", "sessions")
 DEFAULT_INTERVAL_S = 15.0
 BATCH_SIZE = 64
 
+# After this many consecutive failed passes the follower escalates: an ERROR
+# log line per failing pass, one logstream status event per outage, and an
+# unhealthy flag in the heartbeat that `status` surfaces. The 2026-09-01
+# outage failed silently every 15s for hours; this makes that impossible.
+ESCALATION_THRESHOLD = 4
+
 # Marker written next to the palace so `status` can prove a follower is live
 # without guessing from the process table.
 _STATE_DIRNAME = "codex_capture"
@@ -125,7 +131,10 @@ def ensure_activation(palace_path: str, sessions_root: str) -> dict:
     for rollout in iter_rollouts(sessions_root):
         highest = -1
         try:
-            for turn in iter_turns(str(rollout)):
+            # Baseline automation sessions too, even though capture skips
+            # them by default: opting in later must capture new automation
+            # turns, not silently import that history in full.
+            for turn in iter_turns(str(rollout), include_automation=True):
                 if turn.ordinal > highest:
                     highest = turn.ordinal
         except OSError:
@@ -241,6 +250,7 @@ def scan_once(
     collection=None,
     max_turns: Optional[int] = None,
     backfill: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     """One incremental pass over every rollout. Returns write statistics.
 
@@ -250,6 +260,10 @@ def scan_once(
     all of history. ``backfill=True`` ignores the baseline and imports
     everything.
 
+    ``include_automation=False`` (the default) skips non-interactive ``codex
+    exec`` sessions — machine output, not conversation. Opting in routes them
+    to the dedicated automation wing, never the user's.
+
     ``max_turns`` bounds how many turns one call will write. It exists for the
     hub path: an unbounded first scan of a large corpus would hold the hub's
     write path for minutes, which is the starvation mode this transport
@@ -257,6 +271,7 @@ def scan_once(
     and reports ``pending: True`` so the caller comes straight back.
     """
     from .palace import get_collection
+    from .sources.codex import SUBAGENT_THREAD_SOURCES
 
     own_collection = collection is None
     if own_collection:
@@ -266,6 +281,10 @@ def scan_once(
     added = already = skipped = 0
     before_activation = 0
     files_scanned = 0
+    files_automation_skipped = 0
+    files_unparseable = 0
+    subagent_turns_routed = 0
+    automation_turns_captured = 0
     written = 0
     pending = False
     threads: set[str] = set()
@@ -309,8 +328,9 @@ def scan_once(
         # user asked to import.
         cursor = None if backfill else _stored_max_ordinal(collection, source_file)
         baseline = _baseline_for(activation, rollout.stem)
+        report: dict = {}
         try:
-            turns = iter_turns(source_file)
+            turns = iter_turns(source_file, include_automation=include_automation, report=report)
             for turn in turns:
                 if baseline is not None and turn.ordinal <= baseline:
                     # Predates activation; only --backfill imports these.
@@ -326,6 +346,10 @@ def scan_once(
                 meta["adapter_version"] = ADAPTER_VERSION
                 meta["filed_at"] = datetime.now(timezone.utc).isoformat()
                 threads.add(turn.thread_id)
+                if turn.thread_source in SUBAGENT_THREAD_SOURCES:
+                    subagent_turns_routed += 1
+                elif turn.automation:
+                    automation_turns_captured += 1
                 batch_ids.append(turn.drawer_id)
                 batch_docs.append(record.content)
                 batch_metas.append(meta)
@@ -341,23 +365,50 @@ def scan_once(
         except OSError as exc:
             logger.warning("codex follower: unreadable rollout %s (%s)", source_file, exc)
             continue
+        if report.get("automation_skipped"):
+            files_automation_skipped += 1
+        elif (
+            not pending
+            and report.get("content_lines", 0) > 0
+            and not report.get("recognized_entries", 0)
+        ):
+            # The file has content but the parser understood none of it.
+            # This path never degrades to raw-text chunking — a previous
+            # deployment filed 12 such files as raw-JSONL garbage drawers —
+            # so the only correct moves are: say so, and count it.
+            files_unparseable += 1
+            logger.warning(
+                "codex follower: unparseable rollout %s — %d non-empty line(s), "
+                "no recognized entries; skipping (never ingested as raw text)",
+                source_file,
+                report.get("content_lines", 0),
+            )
 
     _flush()
 
     return {
         "files_scanned": files_scanned,
+        "files_automation_skipped": files_automation_skipped,
+        "files_unparseable": files_unparseable,
         "threads_seen": len(threads),
         "drawers_added": added,
         "drawers_already_present": already,
+        "subagent_turns_routed": subagent_turns_routed,
+        "automation_turns_captured": automation_turns_captured,
         "turns_skipped_by_cursor": skipped,
         "turns_before_activation": before_activation,
         "backfill": backfill,
+        "include_automation": include_automation,
         "pending": pending,
     }
 
 
 def capture_pass(
-    palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT, *, backfill: bool = False
+    palace_path: str,
+    sessions_root: str = DEFAULT_SESSIONS_ROOT,
+    *,
+    backfill: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     """One capture pass, routed to whichever writer legitimately owns the palace.
 
@@ -376,7 +427,9 @@ def capture_pass(
     from .codex_hub import HubRefused, HubUnavailable, capture_via_hub
 
     try:
-        stats = capture_via_hub(palace_path, sessions_root, backfill=backfill)
+        stats = capture_via_hub(
+            palace_path, sessions_root, backfill=backfill, include_automation=include_automation
+        )
         stats.setdefault("writer", "hub")
         stats["error"] = ""
         return stats
@@ -398,7 +451,12 @@ def capture_pass(
 
     try:
         with mine_palace_lock(palace_path):
-            stats = scan_once(palace_path, sessions_root, backfill=backfill)
+            stats = scan_once(
+                palace_path,
+                sessions_root,
+                backfill=backfill,
+                include_automation=include_automation,
+            )
     except MineAlreadyRunning as exc:
         # Another writer holds the lease but published no hub endpoint we can
         # reach. Refusing is correct — two writers is the one thing we must
@@ -418,12 +476,53 @@ def capture_pass(
 
 
 def run_once(
-    palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT, *, backfill: bool = False
+    palace_path: str,
+    sessions_root: str = DEFAULT_SESSIONS_ROOT,
+    *,
+    backfill: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     """One capture pass plus a heartbeat, for `codex-capture --once`."""
-    stats = capture_pass(palace_path, sessions_root, backfill=backfill)
+    stats = capture_pass(
+        palace_path, sessions_root, backfill=backfill, include_automation=include_automation
+    )
     _write_heartbeat(palace_path, sessions_root=str(sessions_root), last_scan=stats, running=False)
     return stats
+
+
+def _announce_outage(palace_path: str, error: str, writer: str, consecutive: int) -> bool:
+    """Append one logstream status event announcing a capture outage.
+
+    Written straight into ``logstream.sqlite3`` rather than through the hub:
+    the hub is exactly the component that is failing when this fires, and an
+    alarm routed through the failing component is no alarm. Direct SQLite
+    access is safe alongside a running hub — the logstream is WAL-mode and
+    independent of the Chroma writer lease (the same pattern ``cli.py``'s
+    ``_open_logstream`` documents).
+
+    Returns True when the event was appended, so the caller announces once
+    per outage and retries next pass if even this write failed.
+    """
+    try:
+        from .logstream import LOGSTREAM_DB_FILENAME, Logstream
+
+        ls = Logstream(db_path=os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME))
+        ls.append_event(
+            type="status",
+            stream="service/codex-capture",
+            room="ops",
+            from_agent="codex-follower",
+            to_agent="*",
+            body=(
+                f"codex capture outage: {consecutive} consecutive failed passes "
+                f"(writer={writer or 'hub'}, tool=mempalace_codex_capture). "
+                f"Last error: {error}"
+            ),
+        )
+        return True
+    except Exception as exc:
+        logger.error("codex follower: could not announce outage on the logstream: %s", exc)
+        return False
 
 
 def follow(
@@ -432,14 +531,48 @@ def follow(
     interval: float = DEFAULT_INTERVAL_S,
     *,
     max_passes: Optional[int] = None,
+    include_automation: bool = False,
+    escalation_threshold: int = ESCALATION_THRESHOLD,
 ) -> dict:
-    """Scan on an interval until interrupted (or ``max_passes`` is reached)."""
+    """Scan on an interval until interrupted (or ``max_passes`` is reached).
+
+    Failure escalation: ``escalation_threshold`` consecutive failed passes
+    (default 4) flips the loop into a declared outage — every further failing
+    pass logs at ERROR, one status event is appended to the logstream
+    (``type=status``, ``to_agent=*``) per outage, and the heartbeat carries
+    ``consecutive_failures`` so ``status`` shows unhealthy. A clean pass ends
+    the outage and re-arms the announcement.
+    """
     passes = 0
+    consecutive_failures = 0
+    outage_announced = False
     totals = {"drawers_added": 0, "drawers_already_present": 0, "passes": 0}
     try:
         while max_passes is None or passes < max_passes:
-            stats = capture_pass(palace_path, sessions_root)
+            stats = capture_pass(palace_path, sessions_root, include_automation=include_automation)
             passes += 1
+            error = str(stats.get("error") or "")
+            if error:
+                consecutive_failures += 1
+                if consecutive_failures >= escalation_threshold:
+                    logger.error(
+                        "codex follower: %d consecutive failed passes via %s: %s",
+                        consecutive_failures,
+                        stats.get("writer") or "hub",
+                        error,
+                    )
+                    if not outage_announced:
+                        outage_announced = _announce_outage(
+                            palace_path, error, str(stats.get("writer") or ""), consecutive_failures
+                        )
+            else:
+                if outage_announced:
+                    logger.info(
+                        "codex follower: capture recovered after %d failed pass(es)",
+                        consecutive_failures,
+                    )
+                consecutive_failures = 0
+                outage_announced = False
             totals["drawers_added"] += stats["drawers_added"]
             totals["drawers_already_present"] += stats["drawers_already_present"]
             totals["passes"] = passes
@@ -450,6 +583,8 @@ def follow(
                 passes=passes,
                 interval=interval,
                 running=True,
+                consecutive_failures=consecutive_failures,
+                outage_announced=outage_announced,
             )
             if max_passes is not None and passes >= max_passes:
                 break
@@ -458,7 +593,12 @@ def follow(
         pass
     finally:
         _write_heartbeat(
-            palace_path, sessions_root=str(sessions_root), passes=passes, running=False
+            palace_path,
+            sessions_root=str(sessions_root),
+            passes=passes,
+            running=False,
+            consecutive_failures=consecutive_failures,
+            outage_announced=outage_announced,
         )
     return totals
 
@@ -499,7 +639,9 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
       recover from on the next attempt.
     * ``BLOCKED``  — the last pass could not write at all: another process
       owns the writer lease with no reachable hub, or the hub refused. Turns
-      are not lost, but nothing is being captured until it clears.
+      are not lost, but nothing is being captured until it clears. A follower
+      that has hit :data:`ESCALATION_THRESHOLD` consecutive failed passes is
+      also BLOCKED, with ``unhealthy: True`` and the failure count surfaced.
     """
     from .codex_hub import hub_is_healthy, hub_target
 
@@ -509,6 +651,10 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
     last = hb.get("last_scan") or {}
     last_error = str(last.get("error") or "")
     writer = str(last.get("writer") or "")
+    consecutive_failures = hb.get("consecutive_failures")
+    if not isinstance(consecutive_failures, int):
+        consecutive_failures = 0
+    unhealthy = consecutive_failures >= ESCALATION_THRESHOLD
 
     target = hub_target(palace_path)
     hub_url = target[0] if target else ""
@@ -537,7 +683,7 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
         palace_error = f"{type(exc).__name__}: {exc}"
         logger.warning("codex status: palace read failed (%s)", exc)
 
-    if writer == "blocked" or (writer == "hub" and last_error):
+    if writer == "blocked" or (writer == "hub" and last_error) or unhealthy:
         state = "BLOCKED"
     elif running and not last_error:
         state = "ACTIVE"
@@ -546,6 +692,9 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
 
     return {
         "state": state,
+        "unhealthy": unhealthy,
+        "consecutive_failures": consecutive_failures,
+        "outage_announced": bool(hb.get("outage_announced")),
         "follower_running": running,
         "follower_pid": pid,
         "heartbeat_at": hb.get("updated_at"),

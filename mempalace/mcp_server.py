@@ -5033,7 +5033,12 @@ def tool_patch_submit(
 # ==================== MCP PROTOCOL ====================
 
 
-def tool_codex_capture(sessions_root: str = "", max_turns: int = 500, backfill: bool = False):
+def tool_codex_capture(
+    sessions_root: str = "",
+    max_turns: int = 500,
+    backfill: bool = False,
+    include_automation: bool = False,
+):
     """Capture Codex session turns into the palace from inside the hub.
 
     Exists so the Codex follower never has to compete for the palace writer
@@ -5065,7 +5070,13 @@ def tool_codex_capture(sessions_root: str = "", max_turns: int = 500, backfill: 
     try:
         # The hub already holds the writer lease; scan_once must not take it
         # again, so it is called directly rather than through run_once.
-        stats = scan_once(_config.palace_path, root, max_turns=budget, backfill=bool(backfill))
+        stats = scan_once(
+            _config.palace_path,
+            root,
+            max_turns=budget,
+            backfill=bool(backfill),
+            include_automation=bool(include_automation),
+        )
     except Exception as exc:  # pragma: no cover - surfaced to the caller
         return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -5523,6 +5534,14 @@ TOOLS = {
                     "description": (
                         "Import turns that predate the activation point too "
                         "(default false: only new turns are captured)."
+                    ),
+                },
+                "include_automation": {
+                    "type": "boolean",
+                    "description": (
+                        "Also capture non-interactive codex exec sessions, routed to the "
+                        "dedicated codex_automation wing (default false: they are skipped "
+                        "and counted as files_automation_skipped)."
                     ),
                 },
             },

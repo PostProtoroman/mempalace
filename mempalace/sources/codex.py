@@ -33,14 +33,21 @@ Deliberately never ingested:
   it never reaches the ``event_msg`` branch and ``replacement_history`` is
   never read.
 - Automation sessions (``originator == "codex_exec"`` / ``source ==
-  "exec"``). These are non-interactive runs; they are machine output, not a
-  conversation the user had.
+  "exec"``) — by default. These are non-interactive runs; they are machine
+  output, not a conversation the user had. ``include_automation=True`` opts
+  them in, and they are then routed to the :data:`AUTOMATION_WING` so they
+  never mix with the user's own conversations.
 - ``item_completed`` items of non-conversation types (``Reasoning``,
   ``CommandExecution``, ``ContextCompaction``, ``FileChange`` …).
 
-Subagent sessions *are* ingested, with their lineage preserved:
-``thread_source`` and ``parent_thread_id`` ride along as drawer metadata so
-a subagent turn stays attributable to the thread that spawned it.
+Subagent sessions *are* ingested, with their lineage preserved — but never
+into the user's project wings. A session whose ``thread_source`` is
+``subagent`` or ``guardian_review`` is machine-to-machine delegation, and a
+prior deployment that filed 200 of 283 real rollouts into user-visible wings
+proved how badly that pollutes user memory. Those sessions are routed to the
+dedicated :data:`SUBAGENT_WING`, with ``thread_source`` and
+``parent_thread_id`` riding along as drawer metadata so a subagent turn
+stays attributable to the thread that spawned it.
 """
 
 from __future__ import annotations
@@ -73,6 +80,15 @@ _LEGACY_ROLES = {"user_message": "user", "agent_message": "assistant"}
 _AUTOMATION_ORIGINATORS = frozenset({"codex_exec"})
 _AUTOMATION_SOURCES = frozenset({"exec"})
 
+# session_meta thread_source values that mark machine-to-machine sessions.
+# These are never allowed into the user's project wings.
+SUBAGENT_THREAD_SOURCES = frozenset({"subagent", "guardian_review"})
+
+# Dedicated wings for non-user content, so it can never shadow the user's
+# own conversations in search or recall.
+SUBAGENT_WING = "codex_subagents"
+AUTOMATION_WING = "codex_automation"
+
 ADAPTER_VERSION = "1.0.0"
 
 
@@ -92,6 +108,7 @@ class CodexTurn:
     parent_thread_id: str
     cwd: str
     originator: str
+    automation: bool = False
 
     @property
     def drawer_id(self) -> str:
@@ -159,13 +176,32 @@ def _derived_item_id(rollout_key: str, ordinal: int) -> str:
     return f"legacy-{digest[:24]}"
 
 
-def iter_turns(path: str) -> Iterator[CodexTurn]:
+def iter_turns(
+    path: str,
+    *,
+    include_automation: bool = False,
+    report: Optional[dict] = None,
+) -> Iterator[CodexTurn]:
     """Yield every completed conversation turn in one rollout file.
 
     Malformed lines are skipped rather than aborting the file: a partially
     written trailing line is normal for a session that is still running, and
     the follower is expected to pick it up on the next pass.
+
+    ``include_automation`` opts non-interactive ``codex exec`` sessions in;
+    by default they yield nothing. ``report``, when given, is filled in
+    place with what the parser saw — ``content_lines`` (non-empty lines),
+    ``recognized_entries`` (lines that parsed as a typed rollout entry),
+    ``automation`` and ``automation_skipped`` — so a caller can tell "empty
+    file" from "automation run" from "file no parser understood" without a
+    second read.
     """
+    if report is not None:
+        report.setdefault("content_lines", 0)
+        report.setdefault("recognized_entries", 0)
+        report.setdefault("automation", False)
+        report.setdefault("automation_skipped", False)
+
     p = Path(path)
     if not stat.S_ISREG(p.stat().st_mode):
         raise OSError(f"Refusing non-regular file: {path}")
@@ -180,12 +216,17 @@ def iter_turns(path: str) -> Iterator[CodexTurn]:
             raw = raw.strip()
             if not raw:
                 continue
+            if report is not None:
+                report["content_lines"] += 1
             try:
                 entry = json.loads(raw)
             except json.JSONDecodeError:
                 continue
             if not isinstance(entry, dict):
                 continue
+            if isinstance(entry.get("type"), str):
+                if report is not None:
+                    report["recognized_entries"] += 1
 
             entry_type = entry.get("type")
 
@@ -198,10 +239,14 @@ def iter_turns(path: str) -> Iterator[CodexTurn]:
                         session_meta = payload
                         saw_meta = True
                     automation = automation or _is_automation(payload)
+                    if report is not None:
+                        report["automation"] = automation
                 continue
 
-            if automation:
+            if automation and not include_automation:
                 # Non-interactive run: stop before extracting anything.
+                if report is not None:
+                    report["automation_skipped"] = True
                 return
 
             # Everything that is not event_msg is skipped, which is what keeps
@@ -250,6 +295,7 @@ def iter_turns(path: str) -> Iterator[CodexTurn]:
                     parent_thread_id=str(session_meta.get("parent_thread_id") or ""),
                     cwd=str(session_meta.get("cwd") or ""),
                     originator=str(session_meta.get("originator") or ""),
+                    automation=automation,
                 )
                 continue
 
@@ -272,6 +318,7 @@ def iter_turns(path: str) -> Iterator[CodexTurn]:
                 parent_thread_id=str(session_meta.get("parent_thread_id") or ""),
                 cwd=str(session_meta.get("cwd") or ""),
                 originator=str(session_meta.get("originator") or ""),
+                automation=automation,
             )
 
 
@@ -284,11 +331,22 @@ def resolve_route(turn: CodexTurn, source_file: str) -> RouteHint:
     Codex turn is filed exactly where the same conversation would land if it
     had been mined by ``mempalace mine --mode convos``: ``wing_api`` for
     AI-tool paths (``.codex`` is one), and a topic-scored room.
+
+    Machine sessions are guarded first, before any of that: a subagent or
+    guardian-review thread goes to :data:`SUBAGENT_WING` and an opted-in
+    automation run goes to :data:`AUTOMATION_WING`, never to the wing the
+    user's own conversations live in. The guard keys on what the session
+    *is* (``thread_source`` / originator), not on where the file sits, so no
+    path layout can route machine output into user memory.
     """
     from ..convo_miner import _resolve_wing, detect_convo_room
 
-    wing = _resolve_wing(Path(source_file), None)
     room = detect_convo_room(turn.text)
+    if turn.thread_source in SUBAGENT_THREAD_SOURCES:
+        return RouteHint(wing=SUBAGENT_WING, room=room)
+    if turn.automation:
+        return RouteHint(wing=AUTOMATION_WING, room=room)
+    wing = _resolve_wing(Path(source_file), None)
     return RouteHint(wing=wing, room=room)
 
 
@@ -326,6 +384,7 @@ def turn_to_drawer(turn: CodexTurn, source_file: str) -> DrawerRecord:
             "cwd": turn.cwd,
             "workspace": turn.cwd,
             "originator": turn.originator,
+            "automation": turn.automation,
             "agent": "codex",
             "added_by": "codex",
             "ingest_mode": "codex_session",
@@ -454,6 +513,12 @@ class CodexSessionAdapter(BaseSourceAdapter):
                 ),
                 "added_by": f(type="string", required=True, description="Always 'codex'"),
                 "originator": f(type="string", required=False, description="Codex client identity"),
+                "automation": f(
+                    type="bool",
+                    required=True,
+                    description="True for an opted-in codex exec run",
+                    indexed=True,
+                ),
                 "agent": f(
                     type="string", required=True, description="Always 'codex'", indexed=True
                 ),
@@ -466,6 +531,8 @@ class CodexSessionAdapter(BaseSourceAdapter):
 
     def ingest(self, *, source: SourceRef, palace) -> Iterator[object]:
         root = source.local_path or os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+        # RFC 002 §4.3: adapter options ride in SourceRef.options.
+        include_automation = bool(source.options.get("include_automation", False))
         for rollout in iter_rollouts(root):
             try:
                 st = rollout.stat()
@@ -481,7 +548,7 @@ class CodexSessionAdapter(BaseSourceAdapter):
                 palace._skip_requested = False
                 continue
             try:
-                turns = list(iter_turns(str(rollout)))
+                turns = list(iter_turns(str(rollout), include_automation=include_automation))
             except OSError:
                 continue
             for turn in turns:

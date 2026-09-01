@@ -149,12 +149,16 @@ Capture Codex CLI session turns into the palace from inside the hub. Exists so t
 
 Bounded by `max_turns` so a first-time scan of a large corpus cannot park the hub's write path; repeat the call while the response has `pending: true`.
 
+Machine sessions are guarded: a session whose `thread_source` is `subagent` or `guardian_review` is routed to the dedicated `codex_subagents` wing (with `parent_thread_id` in its metadata), never to the wing the user's own conversations land in. Non-interactive `codex exec` sessions (`originator: codex_exec`) are skipped entirely unless `include_automation` is true, in which case they go to the dedicated `codex_automation` wing. A rollout the parser yields no messages for is never ingested as raw text — it is counted in `files_unparseable` and named in a warning log line.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `sessions_root` | string | No | Codex sessions directory (default: `~/.codex/sessions`) |
 | `max_turns` | integer | No | Max turns to write in this call (default 500) |
+| `backfill` | boolean | No | Import turns that predate the activation point too (default false: only new turns) |
+| `include_automation` | boolean | No | Also capture `codex exec` automation sessions, routed to `codex_automation` (default false: skipped and counted) |
 
-**Returns:** `{ success, files_scanned, threads_seen, drawers_added, drawers_already_present, turns_skipped_by_cursor, pending }` on success, or `{ success: false, error }` on failure. Drawer ids are deterministic, so repeated calls add nothing and are counted as `drawers_already_present`.
+**Returns:** `{ success, files_scanned, files_automation_skipped, files_unparseable, threads_seen, drawers_added, drawers_already_present, subagent_turns_routed, automation_turns_captured, turns_skipped_by_cursor, turns_before_activation, backfill, include_automation, pending }` on success, or `{ success: false, error }` on failure. Drawer ids are deterministic, so repeated calls add nothing and are counted as `drawers_already_present`.
 
 ---
 

@@ -193,6 +193,8 @@ def test_turns_are_routed_by_the_conversation_miner_resolvers(tmp_path):
 
 
 def test_routing_metadata_is_preserved_end_to_end(tmp_path):
+    from mempalace.sources.codex import SUBAGENT_WING
+
     palace = str(tmp_path / "palace")
     codex_dir = tmp_path / ".codex" / "sessions"
     _write_rollout(
@@ -211,7 +213,9 @@ def test_routing_metadata_is_preserved_end_to_end(tmp_path):
         where={"ingest_mode": "codex_session"}, include=["metadatas"]
     )
     meta = (data.get("metadatas") or [])[0]
-    assert meta["wing"] == "wing_api"
+    # A subagent session never lands in the user's wing — it goes to the
+    # dedicated subagent wing with its lineage intact.
+    assert meta["wing"] == SUBAGENT_WING
     assert meta["room"] and meta["room"] != "unknown"
     assert meta["session_id"] and meta["thread_id"]
     assert meta["parent_thread_id"] == "parent-9"
