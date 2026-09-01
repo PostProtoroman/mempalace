@@ -35,6 +35,22 @@ def test_plugin_manifest_references_supported_components():
     assert "hooks" not in manifest
 
 
+def test_plugin_manifest_relative_paths_resolve_inside_plugin_dir():
+    """Codex resolves manifest-relative paths against the manifest's own
+    directory (.codex-plugin/), not the repo root — the same directory
+    plugin.json itself lives in. Every relative path the manifest declares
+    must exist there, or Codex plugin loading fails silently at runtime.
+    """
+    manifest = _read_json(MANIFEST_PATH)
+    plugin_dir = MANIFEST_PATH.parent
+
+    skills_path = plugin_dir / manifest["skills"]
+    assert skills_path.is_dir(), f"missing {skills_path}"
+
+    mcp_path = plugin_dir / manifest["mcpServers"]
+    assert mcp_path.is_file(), f"missing {mcp_path}"
+
+
 def test_mcp_config_registers_mempalace_server():
     config = _read_json(MCP_PATH)
 

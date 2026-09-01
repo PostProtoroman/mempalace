@@ -9,7 +9,17 @@ Located at `~/.mempalace/config.json`:
   "palace_path": "/custom/path/to/palace",
   "collection_name": "mempalace_drawers",
   "people_map": {"Kai": "KAI", "Priya": "PRI"},
-  "max_backups": 10
+  "max_backups": 10,
+  "hooks": {
+    "mine_interval_secs": 600
+  },
+  "redaction": {
+    "enabled": true
+  },
+  "identity": {
+    "canonical": "mac-claude",
+    "aliases": {"mac-claude": ["claude", "claude_code"]}
+  }
 }
 ```
 
@@ -19,6 +29,10 @@ Located at `~/.mempalace/config.json`:
 | `collection_name` | `mempalace_drawers` | Default backend collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
 | `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
+| `hooks.mine_interval_secs` | `600` | Minimum seconds between transcript mines for the *same* transcript, triggered by the Stop hook. Independent of the diary checkpoint, which still runs every fire. Guards against a runaway re-mine storm spawning a new mine subprocess far more often than intended. `0` disables the rate limit. Env override: `MEMPALACE_HOOKS_MINE_INTERVAL_SECS`. |
+| `redaction.enabled` | `true` | Ingest-time secret redaction (API keys, AWS key IDs, JWTs) before drawer content is stored — see `mempalace/redact.py`. On by default as a safety measure, since the miners are the path that put secrets into a live palace verbatim; set `false` only for a deliberate, documented reason. Env override: `MEMPALACE_REDACTION_ENABLED`. |
+| `identity.canonical` | _(none)_ | This agent's canonical identity name. Unset means callers fall back to their own hardcoded per-harness default. Env override: `MEMPALACE_IDENTITY_CANONICAL`. |
+| `identity.aliases` | `{}` | Map of canonical agent identity → list of alias identities that should be treated as the same agent for diary reads/writes (e.g. `{"mac-claude": ["claude", "claude_code"]}`). Keys and values are normalized to lowercase. Existing drawers filed under an alias can be re-keyed to the canonical name with `mempalace identity-migrate --apply`. |
 
 ## Storage backends
 

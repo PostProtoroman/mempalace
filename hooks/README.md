@@ -87,22 +87,42 @@ integration uses.
 
 ## Install — Codex CLI (OpenAI)
 
-Add to `.codex/hooks.json`:
+Codex hooks are **global**, not project-scoped: they live in
+`~/.codex/hooks.json`, not in any Codex plugin manifest (the Codex plugin
+manifest — `.codex-plugin/plugin.json` — has no `hooks` capability). The
+schema wraps every event under a top-level `"hooks"` key, with the same
+nested matcher-group shape Claude Code uses — a flat `{"Stop": [...]}` map
+is rejected by the real Codex CLI:
 
 ```json
 {
-  "Stop": [{
-    "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
-    "timeout": 30
-  }],
-  "PreCompact": [{
-    "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
-    "timeout": 30
-  }]
+  "hooks": {
+    "Stop": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "timeout": 30
+      }]
+    }],
+    "PreCompact": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "timeout": 30
+      }]
+    }]
+  }
 }
 ```
+
+As of this release, Codex sessions also have a second, independent capture
+path that needs no hooks.json entry at all: the `codex-capture` follower
+service (see `mempalace/codex_follower.py`, `deploy/launchd/ai.mempalace.codex-capture.plist`)
+tails `~/.codex/sessions/` and mines new sessions automatically. The two
+are complementary — hooks.json fires on live Codex lifecycle events, the
+follower service catches everything on disk even if hooks were never wired.
 
 **Other harnesses:** the clean-exit save runs through the harness-agnostic
 `mempalace hook run --hook session-end` entry point. This release wires it

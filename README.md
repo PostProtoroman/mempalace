@@ -304,13 +304,19 @@ system prompt:
 
 ## Auto-save hooks
 
-Auto-save hooks for **Claude Code, Codex CLI, and Cursor IDE** save
-periodically and before context compression:
+Each harness has its own capture story — none of them share a mechanism:
 
-- Claude Code + Codex →
+- **Claude Code** — a plugin-installed `Stop`/`PreCompact` hook pair, wired
+  through `.claude/settings.local.json` or the bundled plugin →
   [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html)
-- Cursor IDE (adds session-start recall and a transcript snapshot before
-  compaction) →
+- **Codex CLI** — two independent, complementary paths: a global
+  `~/.codex/hooks.json` (`Stop`/`PreCompact`, same nested schema as Claude
+  Code) fires on live lifecycle events, and the `codex-capture` follower
+  service (`mempalace codex-capture`, installable as a launchd agent) tails
+  `~/.codex/sessions/` and mines new sessions with no hooks.json entry
+  needed → same [hooks guide](https://mempalaceofficial.com/guide/hooks.html)
+- **Cursor IDE** — its own hook set (adds session-start recall and a
+  transcript snapshot before compaction) →
   [mempalaceofficial.com/guide/cursor-hooks](https://mempalaceofficial.com/guide/cursor-hooks.html)
 
 If you are installing under time pressure, start with the
@@ -321,6 +327,9 @@ wire the hooks, back up existing JSONL transcripts, and backfill them with
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one
 verbatim drawer per user/assistant message, idempotent and resume-safe.
+**Claude Code transcripts only** — the sweeper parses Claude Code's JSONL
+message shape (`sessionId`, message `uuid`, content blocks); it does not
+read Codex rollout files or Cursor transcripts.
 
 ---
 

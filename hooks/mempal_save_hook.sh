@@ -25,13 +25,20 @@
 #     }]
 #   }
 #
-# For Codex CLI, add to .codex/hooks.json:
+# For Codex CLI, add to the GLOBAL ~/.codex/hooks.json (same nested
+# matcher-group shape as above, wrapped in a top-level "hooks" key — a flat
+# {"Stop": [...]} map is rejected by the real Codex CLI):
 #
-#   "Stop": [{
-#     "type": "command",
-#     "command": "/absolute/path/to/mempal_save_hook.sh",
-#     "timeout": 30
-#   }]
+#   "hooks": {
+#     "Stop": [{
+#       "matcher": "*",
+#       "hooks": [{
+#         "type": "command",
+#         "command": "/absolute/path/to/mempal_save_hook.sh",
+#         "timeout": 30
+#       }]
+#     }]
+#   }
 #
 # === HOW IT WORKS ===
 #

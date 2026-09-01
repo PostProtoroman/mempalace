@@ -282,6 +282,21 @@ class TestForwardMineToHub:
         assert "forwarding mine to palace hub" in out
         assert "filed 1" in out
 
+    def test_missing_mode_defaults_to_projects(self, isolated_home, tmp_path, fake_hub):
+        """`mempalace mine <dir> --wing X` with no --mode leaves args.mode as
+        None; forwarding it verbatim sends mode: null and the hub rejects it
+        ("invalid mode 'None'"). The local (non-forwarded) path already
+        defaults via `getattr(args, "mode", None) or "projects"` — forwarding
+        must apply the same default.
+        """
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        args = _mine_args(tmp_path / "proj", mode=None, wing="myproj")
+        handled = cli._forward_mine_to_hub(args, palace)
+        assert handled is True
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
+
     def test_attaches_bearer_token_when_present(self, isolated_home, tmp_path, fake_hub):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)
