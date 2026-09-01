@@ -245,6 +245,10 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
                 query,
                 "/fake/palace",
                 n_results=5,
+                # MagicMock collection has no real lexical_search; isolate
+                # the vector-pool widening/hydration mechanics under test
+                # from the union default.
+                candidate_strategy="vector",
             )
 
     hits = result["results"]

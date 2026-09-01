@@ -2065,7 +2065,6 @@ class TestSearchTool:
     @pytest.mark.parametrize(
         ("arguments", "control"),
         [
-            ({"candidate_strategy": "union"}, "candidate_strategy"),
             ({"min_similarity": 0.5}, "min_similarity"),
             ({"max_distance": 0.5}, "max_distance"),
             ({"context": "background"}, "context"),
@@ -2081,6 +2080,40 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="needle", cli_compatible=True, **arguments)
 
         assert control in result["error"]
+
+    def test_search_cli_compatible_accepts_explicit_default_candidate_strategy(
+        self, monkeypatch, config, kg
+    ):
+        """candidate_strategy="union" is now DEFAULT_CANDIDATE_STRATEGY, the
+        same strategy `cli_search` (searcher.search) already defers to
+        internally on the cli_compatible path — so requesting it explicitly
+        is no longer an unsupported override."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+
+        result = mcp_server.tool_search(
+            query="needle", cli_compatible=True, candidate_strategy="union"
+        )
+
+        assert "error" not in result
+
+    def test_search_cli_compatible_rejects_explicit_vector_override(self, monkeypatch, config, kg):
+        """cli_compatible always defers to cli_search's own default (union);
+        it has no way to honor an explicit override away from that default."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(
+            query="needle", cli_compatible=True, candidate_strategy="vector"
+        )
+
+        assert "candidate_strategy" in result["error"]
 
     def test_search_cli_compatible_returns_stderr(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

@@ -42,6 +42,17 @@ _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
 
 logger = logging.getLogger("mempalace_mcp")
 
+# Single source of truth for the default candidate_strategy across every
+# caller (search_memories, the mempalace_search MCP tool, the CLI search
+# path). "vector"-only re-ranks just the top n_results*4 vector neighbors,
+# so a drawer with an exact-token match that embeds far from the query
+# (mechanical text: log lines, hex ids, diffs) is silently missed even
+# though the recall promise (CLAUDE.md: "100% recall is the design
+# requirement") says it shouldn't be. "union" also pulls lexical (BM25)
+# candidates into the rerank pool, closing that gap. Explicit "vector"
+# remains available for callers that want the cheaper, historical behavior.
+DEFAULT_CANDIDATE_STRATEGY = "union"
+
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
@@ -668,13 +679,20 @@ def search(
     since: str = None,
     before: str = None,
     collection=None,
+    candidate_strategy: str = DEFAULT_CANDIDATE_STRATEGY,
 ):
     """
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect), and/or narrow to
     drawers whose ``filed_at`` falls in the ``[since, before)`` window —
     same semantics as ``search_memories``/``list_drawers`` (#1128/#463).
+
+    ``candidate_strategy`` mirrors ``search_memories``: ``"union"`` (the
+    default) also pulls lexical/BM25 candidates into the rerank pool so an
+    exact-token match that embeds far from the query isn't silently missed;
+    ``"vector"`` preserves the cheaper vector-only rerank pool.
     """
+    _validate_candidate_strategy(candidate_strategy)
     # Resolved before the fence below: both exits from this function rank by
     # BM25, so the filter has to be in hand on either branch.
     stop_words = _resolve_stop_words(None)
@@ -783,11 +801,50 @@ def search(
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
+    if candidate_strategy == "union":
+        # Widen the rerank pool with lexical (BM25) candidates the vector
+        # fetch above may have missed entirely — same gap `_hybrid_rank`
+        # alone can't close, since it only re-scores what was already
+        # fetched. Falls back to vector-only silently if the backend
+        # doesn't support lexical search (e.g. a non-Chroma backend).
+        try:
+            _apply_candidate_strategy(
+                candidate_strategy,
+                hits,
+                col,
+                query,
+                wing,
+                room,
+                n_results,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            )
+        except UnsupportedCapabilityError:
+            logger.debug(
+                "candidate_strategy=union unsupported by backend; falling back to vector-only",
+                exc_info=True,
+            )
+        else:
+            # `_merge_bm25_union_candidates` appends items shaped for the
+            # search_memories flat result format (top-level wing/room/
+            # source_file); this CLI path renders `hit["metadata"]`. Give
+            # every appended item a matching metadata dict so printing
+            # below works uniformly regardless of which side added the hit.
+            for hit in hits:
+                if "metadata" not in hit:
+                    hit["metadata"] = {
+                        "wing": hit.get("wing", "unknown"),
+                        "room": hit.get("room", "unknown"),
+                        "source_file": hit.get("source_path") or hit.get("source_file", "?"),
+                        "filed_at": hit.get("created_at"),
+                        "authored_at": hit.get("authored_at"),
+                    }
+    hits = _dedupe_rendered_hits(hits)
     hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
-    if date_window_active:
-        # The widened fetch exists only to survive the window filter; the
-        # display contract stays "top n_results", now cut AFTER the re-rank.
-        hits = hits[:n_results]
+    # The vector fetch, the date-window widening, and the union merge above
+    # can each add rows beyond n_results; the display contract stays "top
+    # n_results", cut AFTER the re-rank so the best matches survive.
+    hits = hits[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -1967,7 +2024,7 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
-    candidate_strategy: str = "vector",
+    candidate_strategy: str = DEFAULT_CANDIDATE_STRATEGY,
     collection_name: str = None,
     lang: Optional[str] = None,
 ) -> dict:
@@ -2003,11 +2060,12 @@ def search_memories(
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
 
-            * ``"vector"`` (default) — preserves historical behavior: top
+            * ``"vector"`` — preserves historical behavior: top
               ``n_results * 4`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
-              embedding space.
-            * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
+              embedding space. A drawer with a strong exact-token/BM25 match
+              that embeds far from the query can be missed under this mode.
+            * ``"union"`` (default) — also pull top ``n_results * 3`` lexical candidates
               through the backend's ``lexical_search`` capability and merge
               them into the rerank pool (deduped by source_file). Catches docs
               with strong BM25 signal that are vector-distant from the query.

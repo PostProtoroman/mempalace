@@ -2245,6 +2245,22 @@ def status(palace_path: str):
     """
     from .backends.chroma import _sqlite_wing_room_counts, hnsw_capacity_status
 
+    # Cheap, cached probe (see hnsw_capacity_status docstring) so a routine
+    # status check can surface a quarantined/diverged HNSW segment even
+    # when the sqlite fast path below succeeds and would otherwise print a
+    # clean-looking drawer count with no hint that vector search is
+    # degraded (#1493 recovery doc: search silently falls back to
+    # BM25-only while sqlite counts stay unaffected).
+    capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    search_degraded = bool(capacity_info.get("diverged"))
+    if search_degraded:
+        print(
+            f"\n  WARNING: search_degraded — HNSW index diverged: "
+            f"{capacity_info.get('message', '')}"
+        )
+        print("  Vector search is falling back to BM25-only until repaired.")
+        print("  Run `mempalace repair --mode from-sqlite --archive-existing` to restore it.\n")
+
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
@@ -2260,9 +2276,7 @@ def status(palace_path: str):
     # class, which a try/except around count() cannot catch. This fallback
     # only runs when the direct sqlite read above was unavailable, so it's
     # the one place in this function that still touches count() directly.
-    capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
-    if capacity_info.get("diverged"):
-        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+    if search_degraded:
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
