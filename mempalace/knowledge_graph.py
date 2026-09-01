@@ -48,6 +48,28 @@ from .ids import make_triple_id
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
 
+# Pre-#2401 launch modes disagreed on where the KG lived: the MCP hub
+# (``--palace``) and ``mempalace mine`` wrote ``<palace>/knowledge_graph.sqlite3``,
+# while stdio-mode MCP (no ``--palace``) and the hermes integration fell back to
+# this legacy, palace-independent path -- stranding facts depending on which
+# mode wrote them. ``DEFAULT_KG_PATH`` is kept only as the source location for
+# ``mempalace kg-migrate``; it must not be read as a fallback anywhere else.
+LEGACY_KG_PATH = DEFAULT_KG_PATH
+
+
+def resolve_kg_path(palace_path: str) -> str:
+    """One resolution rule for the knowledge graph: it lives inside the palace.
+
+    Every construction site -- the MCP server (hub or stdio, ``--palace`` or
+    not), the CLI, and the hermes integration -- must route through this
+    function so a fact written from one launch mode is visible from every
+    other. Given the effective palace directory, returns
+    ``<palace>/knowledge_graph.sqlite3``.
+    """
+    return os.path.join(
+        os.path.abspath(os.path.expanduser(str(palace_path))), "knowledge_graph.sqlite3"
+    )
+
 
 def _is_date_only_temporal(value: str) -> bool:
     return isinstance(value, str) and len(value) == 10 and value[4] == "-" and value[7] == "-"

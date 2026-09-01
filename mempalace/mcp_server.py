@@ -104,7 +104,7 @@ from .hallways import (  # noqa: E402
     delete_hallway,
 )
 
-from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH, resolve_kg_path  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
@@ -333,6 +333,7 @@ _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+_kg_legacy_split_warned = False
 
 _logstream_by_path: dict[str, Logstream] = {}
 _logstream_cache_lock = threading.Lock()
@@ -1098,10 +1099,63 @@ def _mcp_idle_timeout_secs() -> float:
     return _MCP_IDLE_HOURS_DEFAULT * 3600
 
 
+def _legacy_kg_triple_count(path: str) -> Optional[int]:
+    """Best-effort triple count for ``path``, or ``None`` if it can't be read."""
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM triples").fetchone()
+            return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return None
+
+
+def _warn_if_legacy_kg_stranded(resolved_path: str) -> None:
+    """Log once per process when the legacy KG holds facts the palace KG lacks.
+
+    Fires only when the legacy file exists, is non-empty, resolves to a
+    different file than ``resolved_path``, and its triple count differs from
+    the palace KG's -- a cheap proxy for "these two graphs have diverged"
+    without hashing either database on every call.
+    """
+    global _kg_legacy_split_warned
+    if _kg_legacy_split_warned:
+        return
+    _kg_legacy_split_warned = True
+    try:
+        if not os.path.exists(DEFAULT_KG_PATH) or os.path.getsize(DEFAULT_KG_PATH) == 0:
+            return
+        if _canonicalize_kg_path(DEFAULT_KG_PATH) == _canonicalize_kg_path(resolved_path):
+            return
+        legacy_count = _legacy_kg_triple_count(DEFAULT_KG_PATH)
+        if legacy_count is None or legacy_count == 0:
+            return
+        palace_count = _legacy_kg_triple_count(resolved_path) or 0
+        if legacy_count == palace_count:
+            return
+        logger.warning(
+            "Legacy knowledge graph at %s has %d triple(s) not reflected in the "
+            "palace KG at %s (%d triple(s)). Run `mempalace kg-migrate --apply` "
+            "to merge the stranded facts.",
+            DEFAULT_KG_PATH,
+            legacy_count,
+            resolved_path,
+            palace_count,
+        )
+    except OSError:
+        pass
+
+
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
-        return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    return DEFAULT_KG_PATH
+    """Resolve the palace's knowledge-graph path from the effective palace.
+
+    ``_config.palace_path`` already reflects whichever launch mode set it
+    (``--palace``, ``MEMPALACE_PALACE_PATH``/``MEMPAL_PALACE_PATH``, or the
+    default), so no separate flag check is needed: every mode routes through
+    the same :func:`resolve_kg_path` rule.
+    """
+    resolved = resolve_kg_path(_config.palace_path)
+    _warn_if_legacy_kg_stranded(resolved)
+    return resolved
 
 
 def _canonicalize_kg_path(path: str) -> str:

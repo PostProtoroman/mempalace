@@ -560,8 +560,8 @@ def test_list_rooms_tool_marks_truncated_without_wing_total(provider_on_seeded_p
 # ----- Knowledge-graph tool handlers --------------------------------------
 
 
-def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_path):
-    """The provider writes to ``<palace_path>/../knowledge_graph.sqlite3``."""
+def test_kg_add_persists_to_palace_sqlite(initialized_provider, palace_path):
+    """The provider writes to ``<palace_path>/knowledge_graph.sqlite3``."""
     from mempalace.knowledge_graph import KnowledgeGraph
 
     result = json.loads(
@@ -572,7 +572,7 @@ def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_p
     )
     assert result["status"] == "ok"
 
-    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    db_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
     independent_kg = KnowledgeGraph(db_path=db_path)
     try:
         relations = independent_kg.query_entity("user")
@@ -858,9 +858,10 @@ def test_hermes_config_defers_to_mempalace_config_when_unset(
         provider.shutdown()
 
 
-def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path):
-    # All five KG tools must hit the SAME database: the sibling of the
-    # provider's palace dir — never mcp_server's global DEFAULT_KG_PATH.
+def test_kg_tools_all_use_provider_palace_kg(initialized_provider, palace_path):
+    # All five KG tools must hit the SAME database: inside the provider's
+    # palace dir (resolve_kg_path) — never mcp_server's global DEFAULT_KG_PATH
+    # and never a sibling of the palace dir.
     add = json.loads(
         initialized_provider.handle_tool_call(
             "mempalace_kg_add",
@@ -886,8 +887,8 @@ def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path)
     )
     assert inv["success"] is True
 
-    # And the file itself lives next to the palace dir.
-    assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+    # And the file itself lives inside the palace dir.
+    assert (Path(palace_path) / "knowledge_graph.sqlite3").exists()
 
 
 def test_kg_invalidate_rejects_invalid_input(initialized_provider):
@@ -915,7 +916,7 @@ def test_on_memory_write_mirrors_both_targets(initialized_provider, palace_path)
     initialized_provider.on_memory_write("add", "memory", "repo uses uv for deps")
     initialized_provider._worker_queue.join()
 
-    kg = KnowledgeGraph(db_path=str(Path(palace_path).parent / "knowledge_graph.sqlite3"))
+    kg = KnowledgeGraph(db_path=str(Path(palace_path) / "knowledge_graph.sqlite3"))
     try:
         user_relations = kg.query_entity("user")
         agent_relations = kg.query_entity("hermes")

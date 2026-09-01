@@ -610,3 +610,149 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
         parts.append(f"{len(topic_renames)} topic key(s)")
     print(f"\n  Migrated {', '.join(parts)}.\n")
     return True
+
+
+_TRIPLE_ROW_DEFAULTS = {
+    "valid_from": None,
+    "valid_to": None,
+    "confidence": 1.0,
+    "source_closet": None,
+    "source_file": None,
+    "source_drawer_id": None,
+    "adapter_name": None,
+    "extracted_at": None,
+}
+
+_ENTITY_ROW_DEFAULTS = {
+    "type": "unknown",
+    "properties": "{}",
+    "created_at": None,
+}
+
+
+def migrate_knowledge_graph(palace_path: str, apply: bool = False) -> dict:
+    """Merge triples/entities from the legacy KG into ``palace_path``'s KG.
+
+    Pre-#2401, some launch modes (stdio MCP with no ``--palace``, the
+    hermes integration) wrote facts to the legacy, palace-independent
+    ``~/.mempalace/knowledge_graph.sqlite3`` instead of
+    ``<palace>/knowledge_graph.sqlite3``. This merges those stranded facts
+    into the palace's own KG.
+
+    Idempotent: a legacy triple or entity is skipped when a row with the
+    same ``id`` (the primary key -- see ``ids.make_triple_id`` for what
+    identity means for a triple) already exists in the target. Running
+    this twice merges zero the second time.
+
+    Dry-run by default (``apply=False``): reports what would be merged and
+    writes nothing. Pass ``apply=True`` to actually write. Never deletes or
+    modifies the legacy file -- only reports what to do with it once the
+    merge is verified.
+
+    Returns a dict of counts: ``legacy_path``, ``target_path``,
+    ``legacy_triples``, ``legacy_entities``, ``merged_triples``,
+    ``merged_entities``, ``skipped_existing``, ``applied``.
+    """
+    from .knowledge_graph import LEGACY_KG_PATH, KnowledgeGraph, resolve_kg_path
+
+    legacy_path = LEGACY_KG_PATH
+    target_path = resolve_kg_path(palace_path)
+
+    result = {
+        "legacy_path": legacy_path,
+        "target_path": target_path,
+        "legacy_triples": 0,
+        "legacy_entities": 0,
+        "merged_triples": 0,
+        "merged_entities": 0,
+        "skipped_existing": 0,
+        "applied": False,
+    }
+
+    if os.path.realpath(legacy_path) == os.path.realpath(target_path):
+        print("  Legacy KG and palace KG are the same file -- nothing to migrate.")
+        return result
+
+    if not os.path.exists(legacy_path) or os.path.getsize(legacy_path) == 0:
+        print(f"  No legacy knowledge graph found at {legacy_path} -- nothing to migrate.")
+        return result
+
+    with closing(sqlite3.connect(legacy_path)) as legacy_conn:
+        legacy_conn.row_factory = sqlite3.Row
+        try:
+            legacy_triples = legacy_conn.execute("SELECT * FROM triples").fetchall()
+            legacy_entities = legacy_conn.execute("SELECT * FROM entities").fetchall()
+        except sqlite3.OperationalError as exc:
+            print(f"  Legacy KG at {legacy_path} is unreadable ({exc}) -- skipping.")
+            return result
+
+    result["legacy_triples"] = len(legacy_triples)
+    result["legacy_entities"] = len(legacy_entities)
+
+    if not legacy_triples and not legacy_entities:
+        print("  Legacy knowledge graph is empty -- nothing to migrate.")
+        return result
+
+    # Ensure the target schema exists (no-op if the palace KG already has
+    # one) before reading/writing rows into it.
+    KnowledgeGraph(db_path=target_path).close()
+
+    with closing(sqlite3.connect(target_path)) as target_conn:
+        target_conn.row_factory = sqlite3.Row
+        existing_triple_ids = {row["id"] for row in target_conn.execute("SELECT id FROM triples")}
+        existing_entity_ids = {row["id"] for row in target_conn.execute("SELECT id FROM entities")}
+
+        new_triples = [
+            {**_TRIPLE_ROW_DEFAULTS, **dict(row)}
+            for row in legacy_triples
+            if row["id"] not in existing_triple_ids
+        ]
+        new_entities = [
+            {**_ENTITY_ROW_DEFAULTS, **dict(row)}
+            for row in legacy_entities
+            if row["id"] not in existing_entity_ids
+        ]
+
+        result["merged_triples"] = len(new_triples)
+        result["merged_entities"] = len(new_entities)
+        result["skipped_existing"] = len(legacy_triples) - len(new_triples)
+
+        print(f"\n  Knowledge-graph migration plan ({legacy_path} -> {target_path}):")
+        print(f"    {len(legacy_triples)} triple(s) in the legacy KG")
+        print(f"    {len(new_triples)} new, {result['skipped_existing']} already present")
+        print(f"    {len(new_entities)} new entity/entities")
+
+        if not apply:
+            print("\n  DRY RUN -- no changes made. Re-run with --apply to write.\n")
+            return result
+
+        if new_entities:
+            target_conn.executemany(
+                "INSERT OR IGNORE INTO entities (id, name, type, properties, created_at) "
+                "VALUES (:id, :name, :type, :properties, :created_at)",
+                new_entities,
+            )
+        if new_triples:
+            target_conn.executemany(
+                """INSERT OR IGNORE INTO triples (
+                    id, subject, predicate, object, valid_from, valid_to,
+                    confidence, source_closet, source_file,
+                    source_drawer_id, adapter_name, extracted_at
+                ) VALUES (
+                    :id, :subject, :predicate, :object, :valid_from, :valid_to,
+                    :confidence, :source_closet, :source_file,
+                    :source_drawer_id, :adapter_name, :extracted_at
+                )""",
+                new_triples,
+            )
+        target_conn.commit()
+
+    result["applied"] = True
+    print(
+        f"\n  Merged {result['merged_triples']} triple(s) and "
+        f"{result['merged_entities']} entity/entities into {target_path}."
+    )
+    print(
+        f"  Legacy file left untouched at {legacy_path} -- safe to archive/delete once verified.\n"
+    )
+    return result

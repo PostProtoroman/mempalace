@@ -197,14 +197,14 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
         return []
 
     try:
-        from .knowledge_graph import KnowledgeGraph
+        from .knowledge_graph import KnowledgeGraph, resolve_kg_path
 
-        # KG lives alongside the palace collection; mcp_server uses the
-        # same convention (see _kg init). Pass ``db_path`` — the previous
-        # code passed a nonexistent ``palace_path`` kwarg which raised
-        # TypeError, silently swallowed by the outer except and rendered
-        # the entire KG-check path dead.
-        kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+        # KG lives inside the palace; mcp_server resolves the same path via
+        # the same ``resolve_kg_path`` rule (see _resolve_kg_path). Pass
+        # ``db_path`` — the previous code passed a nonexistent ``palace_path``
+        # kwarg which raised TypeError, silently swallowed by the outer
+        # except and rendered the entire KG-check path dead.
+        kg = KnowledgeGraph(db_path=resolve_kg_path(palace_path))
     except Exception:
         # KG unavailable (brand-new palace, corrupted DB, etc.) — skip.
         return []

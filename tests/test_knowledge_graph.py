@@ -5,9 +5,42 @@ Covers: entity CRUD, triple CRUD, temporal queries, invalidation,
 timeline, stats, and edge cases (duplicate triples, ID collisions).
 """
 
+import os
+
 import pytest
 import sqlite3
-from mempalace.knowledge_graph import KnowledgeGraph
+from mempalace.knowledge_graph import KnowledgeGraph, resolve_kg_path
+
+
+class TestResolveKgPath:
+    """One resolution rule: the KG lives inside the palace directory."""
+
+    def test_joins_palace_and_filename(self, tmp_path):
+        assert resolve_kg_path(str(tmp_path)) == os.path.join(
+            str(tmp_path), "knowledge_graph.sqlite3"
+        )
+
+    def test_expands_user(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        resolved = resolve_kg_path("~/palace")
+        assert resolved == os.path.join(str(tmp_path), "palace", "knowledge_graph.sqlite3")
+
+    def test_absolute_regardless_of_trailing_slash(self, tmp_path):
+        with_slash = resolve_kg_path(str(tmp_path) + os.sep)
+        without_slash = resolve_kg_path(str(tmp_path))
+        assert with_slash == without_slash
+
+    @pytest.mark.parametrize(
+        "launch_shape",
+        ["hub_with_palace_flag", "stdio_no_flag", "cli_default", "cli_explicit_palace"],
+    )
+    def test_agrees_across_launch_shapes(self, tmp_path, launch_shape):
+        """Every launch mode that resolves to the same effective palace_path
+        must resolve to the same KG file -- the whole point of #2401."""
+        palace_path = str(tmp_path / "palace")
+        # Regardless of which flag/env-var combination produced this
+        # palace_path value, resolve_kg_path must return the same answer.
+        assert resolve_kg_path(palace_path) == os.path.join(palace_path, "knowledge_graph.sqlite3")
 
 
 class TestEntityOperations:

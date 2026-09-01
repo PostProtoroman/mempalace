@@ -1192,7 +1192,7 @@ def mine_source_adapter(
     miners.  Until those miners are migrated to first-party adapters, no-flag
     and ``--mode`` calls must retain their established dispatch paths.
     """
-    from .knowledge_graph import KnowledgeGraph
+    from .knowledge_graph import KnowledgeGraph, resolve_kg_path
     from .palace import get_collection, mine_palace_lock
     from .sources import (
         DrawerRecord,
@@ -1231,9 +1231,7 @@ def mine_source_adapter(
                 knowledge_graph = _DryRunKnowledgeGraphProxy()
             else:
                 drawer_collection = get_collection(palace_path)
-                knowledge_graph = KnowledgeGraph(
-                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
-                )
+                knowledge_graph = KnowledgeGraph(db_path=resolve_kg_path(palace_path))
             context = PalaceContext(
                 drawer_collection=drawer_collection,
                 knowledge_graph=knowledge_graph,
@@ -1864,6 +1862,14 @@ def cmd_migrate(args):
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
     )
+
+
+def cmd_kg_migrate(args):
+    """Merge the legacy ~/.mempalace knowledge graph into the palace's KG."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    from .migrate import migrate_knowledge_graph
+
+    migrate_knowledge_graph(palace_path=palace_path, apply=getattr(args, "apply", False))
 
 
 def cmd_migrate_wings(args):
@@ -4116,6 +4122,14 @@ def main():
     p_restore.add_argument("archive", help="Path to the mempalace-<timestamp>.tar.gz archive")
     p_restore.add_argument(
         "--target", required=True, help="Empty or nonexistent directory to restore into"
+    # kg-migrate
+    p_kg_migrate = sub.add_parser(
+        "kg-migrate",
+        help="Merge the legacy ~/.mempalace knowledge graph into the palace's KG "
+        "(dry-run by default)",
+    )
+    p_kg_migrate.add_argument(
+        "--apply", action="store_true", help="Write the merge (default is dry-run)"
     )
 
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
@@ -4553,6 +4567,7 @@ def main():
         "migrate-wings": cmd_migrate_wings,
         "backup": cmd_backup,
         "restore": cmd_restore,
+        "kg-migrate": cmd_kg_migrate,
         "hallways": cmd_hallways,
         "dedup": cmd_dedup,
         "status": cmd_status,

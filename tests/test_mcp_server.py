@@ -4950,6 +4950,137 @@ class TestImportKillSwitchSafety:
             assert wal_file.parent.stat().st_mode & 0o777 == 0o700
 
 
+class TestResolveKgPathAgreement:
+    """_resolve_kg_path must agree across every launch shape (#2401): the
+    KG lives inside the effective palace directory regardless of how that
+    palace path was set."""
+
+    def test_hub_with_palace_flag(self, tmp_path, monkeypatch):
+        """hub --palace: --palace sets MEMPALACE_PALACE_PATH at import
+        time (see mcp_server.py), which _config.palace_path reflects."""
+        from mempalace import mcp_server
+        from mempalace.knowledge_graph import resolve_kg_path
+
+        palace_dir = tmp_path / "hub_palace"
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_dir))
+
+        assert mcp_server._resolve_kg_path() == resolve_kg_path(str(palace_dir))
+
+    def test_stdio_no_flag_with_env_var(self, tmp_path, monkeypatch):
+        """stdio mode, no --palace, but MEMPALACE_PALACE_PATH set some
+        other way (e.g. the hermes env bridge) must still resolve inside
+        that palace, not the legacy global default."""
+        from mempalace import mcp_server
+        from mempalace.knowledge_graph import DEFAULT_KG_PATH, resolve_kg_path
+
+        palace_dir = tmp_path / "stdio_palace"
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_dir))
+
+        resolved = mcp_server._resolve_kg_path()
+        assert resolved == resolve_kg_path(str(palace_dir))
+        assert resolved != DEFAULT_KG_PATH
+
+    def test_stdio_no_flag_no_env_falls_back_to_default_palace(self, monkeypatch):
+        """stdio mode, nothing configured: falls back to the *palace*
+        default (~/.mempalace/palace/knowledge_graph.sqlite3), not the
+        legacy standalone DEFAULT_KG_PATH."""
+        from mempalace import mcp_server
+        from mempalace.config import DEFAULT_PALACE_PATH
+        from mempalace.knowledge_graph import resolve_kg_path
+
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+        monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+        monkeypatch.setattr(mcp_server._config, "_palace_path_override", None)
+        monkeypatch.setattr(mcp_server._config, "_file_config", {})
+
+        assert mcp_server._resolve_kg_path() == resolve_kg_path(DEFAULT_PALACE_PATH)
+
+    def test_cli_explicit_palace(self, tmp_path):
+        """cli.py's own construction site (mine_source_adapter) must land
+        on the same path as the MCP server's resolver for the same
+        palace_path."""
+        from mempalace.knowledge_graph import resolve_kg_path
+
+        palace_path = str(tmp_path / "cli_palace")
+        # cli.py routes `KnowledgeGraph(db_path=resolve_kg_path(palace_path))`
+        # -- same call the MCP server resolver makes.
+        assert resolve_kg_path(palace_path) == os.path.join(palace_path, "knowledge_graph.sqlite3")
+
+
+class TestLegacyKgStrandedWarning:
+    """Startup consistency check: warn (once per process) when the legacy
+    KG holds facts the palace KG doesn't have."""
+
+    def _reset_warned(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_kg_legacy_split_warned", False)
+
+    def _make_kg_with_triple(self, path):
+        from mempalace.knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph(db_path=str(path))
+        kg.add_triple("alice", "likes", "coffee", valid_from="2026-01-01")
+        kg.close()
+
+    def test_warns_when_legacy_has_extra_triples(self, tmp_path, monkeypatch, caplog):
+        from mempalace import mcp_server
+
+        self._reset_warned(monkeypatch)
+        legacy = tmp_path / "legacy_kg.sqlite3"
+        palace_kg = tmp_path / "palace_kg.sqlite3"
+        self._make_kg_with_triple(legacy)
+
+        monkeypatch.setattr(mcp_server, "DEFAULT_KG_PATH", str(legacy))
+        with caplog.at_level("WARNING", logger="mempalace_mcp"):
+            mcp_server._warn_if_legacy_kg_stranded(str(palace_kg))
+
+        assert any("kg-migrate" in rec.message for rec in caplog.records)
+
+    def test_no_warning_when_legacy_missing(self, tmp_path, monkeypatch, caplog):
+        from mempalace import mcp_server
+
+        self._reset_warned(monkeypatch)
+        monkeypatch.setattr(mcp_server, "DEFAULT_KG_PATH", str(tmp_path / "nope.sqlite3"))
+
+        with caplog.at_level("WARNING", logger="mempalace_mcp"):
+            mcp_server._warn_if_legacy_kg_stranded(str(tmp_path / "palace_kg.sqlite3"))
+
+        assert caplog.records == []
+
+    def test_no_warning_when_counts_match(self, tmp_path, monkeypatch, caplog):
+        from mempalace import mcp_server
+
+        self._reset_warned(monkeypatch)
+        legacy = tmp_path / "legacy_kg.sqlite3"
+        palace_kg = tmp_path / "palace_kg.sqlite3"
+        self._make_kg_with_triple(legacy)
+        self._make_kg_with_triple(palace_kg)
+
+        monkeypatch.setattr(mcp_server, "DEFAULT_KG_PATH", str(legacy))
+        with caplog.at_level("WARNING", logger="mempalace_mcp"):
+            mcp_server._warn_if_legacy_kg_stranded(str(palace_kg))
+
+        assert caplog.records == []
+
+    def test_warns_only_once_per_process(self, tmp_path, monkeypatch, caplog):
+        from mempalace import mcp_server
+
+        self._reset_warned(monkeypatch)
+        legacy = tmp_path / "legacy_kg.sqlite3"
+        self._make_kg_with_triple(legacy)
+        monkeypatch.setattr(mcp_server, "DEFAULT_KG_PATH", str(legacy))
+
+        with caplog.at_level("WARNING", logger="mempalace_mcp"):
+            mcp_server._warn_if_legacy_kg_stranded(str(tmp_path / "palace_kg.sqlite3"))
+            mcp_server._warn_if_legacy_kg_stranded(str(tmp_path / "palace_kg.sqlite3"))
+
+        assert len(caplog.records) == 1
+
+
 class TestKGLazyCache:
     """Lazy per-path KnowledgeGraph cache (issue #1136)."""
 
