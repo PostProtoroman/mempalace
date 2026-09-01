@@ -1441,6 +1441,28 @@ class MempalaceConfig:
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
 
+    @property
+    def hooks_mine_interval_secs(self):
+        """Minimum seconds between transcript mines for the same transcript.
+
+        A per-transcript rate limit on the Stop hook's conversation re-mine,
+        independent of the diary checkpoint (which still runs every fire).
+        Guards against a runaway re-mine storm — e.g. an overcounted
+        Stop-hook fire rate spawning a new mine subprocess for the same
+        transcript far more often than intended. 0 disables the rate limit.
+        Default 600 (10 minutes).
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_MINE_INTERVAL_SECS")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=0)
+            if coerced is not None:
+                return coerced
+        hooks = self._file_config.get("hooks", {})
+        if not isinstance(hooks, dict):
+            hooks = {}
+        coerced = self._try_coerce_int(hooks.get("mine_interval_secs"), minimum=0)
+        return coerced if coerced is not None else 600
+
     def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
         """Resolve the configured write policy for ``hooks`` or ``cli``.
 
