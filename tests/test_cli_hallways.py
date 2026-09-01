@@ -72,3 +72,53 @@ def test_explicit_palace_scopes_hallway_listing(monkeypatch, tmp_path):
     cmd_hallways(Namespace(wing="wing_aya", limit=50, palace=str(selected)))
 
     assert calls == [("wing_aya", str(selected))]
+
+
+def test_prune_dry_run_default(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        hallways_mod,
+        "prune_hallways",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "total": 5,
+                "threshold": kwargs["threshold"],
+                "wing": kwargs["wing"],
+                "removed_count": 2,
+                "kept_count": 3,
+                "estimated_bytes_saved": 120,
+                "dry_run": kwargs["dry_run"],
+            }
+        ),
+    )
+    cmd_hallways(Namespace(wing=None, limit=50, hallways_action="prune", threshold=3, apply=False))
+    assert calls[0]["dry_run"] is True
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "Would remove: 2 / 5" in out
+
+
+def test_prune_apply_disables_dry_run(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        hallways_mod,
+        "prune_hallways",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "total": 5,
+                "threshold": kwargs["threshold"],
+                "wing": kwargs["wing"],
+                "removed_count": 2,
+                "kept_count": 3,
+                "estimated_bytes_saved": 120,
+                "dry_run": kwargs["dry_run"],
+            }
+        ),
+    )
+    cmd_hallways(Namespace(wing=None, limit=50, hallways_action="prune", threshold=3, apply=True))
+    assert calls[0]["dry_run"] is False
+    out = capsys.readouterr().out
+    assert "LIVE" in out
+    assert "Removed: 2 / 5" in out
