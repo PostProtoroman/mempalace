@@ -56,27 +56,90 @@ class TestChunkExchanges:
         max_len = max(len(c["content"]) for c in chunks)
         assert max_len <= CHUNK_SIZE, f"oversized chunk: max_len={max_len}"
 
-    def test_line_group_fallback_drops_sub_min_trailing_group(self):
-        """A trailing line-group whose stripped length is at or below
-        MIN_CHUNK_SIZE must be dropped, not emitted as a tiny drawer."""
+    def test_line_group_fallback_keeps_sub_min_trailing_group(self):
+        """A short trailing line-group is content, not noise — it must be
+        kept verbatim, not dropped below a size floor (2026-09-01: the old
+        MIN_CHUNK_SIZE gate discarded it)."""
         lines = [f"Line {i}" for i in range(51)]
         content = "\n".join(lines)
         chunks = chunk_exchanges(content)
-        from mempalace.convo_miner import MIN_CHUNK_SIZE
 
-        assert len(chunks) == 2, (
-            f"expected 2 drawers (groups 0-24 and 25-49); got {len(chunks)}; "
-            f"the single-line tail group should drop below MIN_CHUNK_SIZE={MIN_CHUNK_SIZE}"
+        assert len(chunks) == 3, (
+            f"expected 3 drawers (groups 0-24, 25-49, and the tail line); got {len(chunks)}"
         )
+        assert chunks[-1]["content"] == "Line 50"
 
     def test_empty_content(self):
         chunks = chunk_exchanges("")
         assert chunks == []
 
-    def test_short_content_skipped(self):
+    def test_short_exchange_kept(self):
+        """Short exchanges are content, not noise. "> yes do it" +
+        "Done, deployed." is exactly the decision class the palace exists
+        to keep; the old MIN_CHUNK_SIZE floor silently dropped it."""
         chunks = chunk_exchanges("> hi\nbye")
-        # Too short to produce chunks (below MIN_CHUNK_SIZE)
-        assert isinstance(chunks, list)
+        assert len(chunks) == 1
+        assert chunks[0]["content"] == "> hi\nbye"
+
+    def test_short_decision_exchange_kept(self):
+        content = "> yes do it\nDone, deployed.\n\n> ok\nShipped.\n\n> thanks\nAnytime.\n"
+        chunks = chunk_exchanges(content)
+        stored = "\n".join(c["content"] for c in chunks)
+        assert "> yes do it\nDone, deployed." in stored
+        assert "> ok\nShipped." in stored
+        assert "> thanks\nAnytime." in stored
+
+    def test_assistant_markdown_rule_survives(self):
+        """An assistant reply containing a markdown horizontal rule must
+        survive byte-complete: '---' has no meaning in the transcript
+        format (_messages_to_transcript never emits it), and treating it
+        as an exchange terminator truncated the reply and discarded the
+        tail (fixed 2026-09-01)."""
+        content = (
+            "> summarize the plan\n"
+            "Part one of the answer.\n"
+            "\n"
+            "---\n"
+            "\n"
+            "Part two after the horizontal rule — must not be lost.\n"
+            "\n"
+            "> next question\n"
+            "Second answer.\n"
+            "\n"
+            "> third question\n"
+            "Third answer.\n"
+        )
+        chunks = chunk_exchanges(content)
+        stored = "\n".join(c["content"] for c in chunks)
+        assert "---" in stored
+        assert "Part two after the horizontal rule — must not be lost." in stored
+        # Byte-complete first exchange, including the rule and blank lines.
+        assert (
+            "Part one of the answer.\n\n---\n\nPart two after the horizontal rule — must not be lost."
+            in stored
+        )
+
+    def test_assistant_yaml_frontmatter_survives(self):
+        """A pasted YAML frontmatter block (lines starting with '---')
+        inside an assistant reply must reach the drawer verbatim."""
+        content = (
+            "> paste the frontmatter\n"
+            "Here is the file:\n"
+            "---\n"
+            "title: My Doc\n"
+            "tags: [a, b]\n"
+            "---\n"
+            "Body of the document follows here.\n"
+            "\n"
+            "> anything else?\n"
+            "No, that is everything.\n"
+            "\n"
+            "> ok\n"
+            "Done.\n"
+        )
+        chunks = chunk_exchanges(content)
+        stored = "\n".join(c["content"] for c in chunks)
+        assert "---\ntitle: My Doc\ntags: [a, b]\n---\nBody of the document follows here." in stored
 
     def test_chunk_size_zero_raises_valueerror(self):
         """Reject chunk_size == 0 explicitly.
@@ -291,13 +354,16 @@ class TestEmitBounded:
         assert chunks[0]["content"] == "a" * 10
         assert chunks[1]["content"] == " " * 10
 
-    def test_whole_content_below_floor_dropped(self):
-        """The floor is applied to the stripped whole content. An all-whitespace
-        input (stripped length 0) or a too-short input is dropped without slicing."""
+    def test_only_truly_empty_content_dropped(self):
+        """Only zero-content input (empty or all-whitespace after strip) is
+        dropped. Content shorter than min_chunk_size is KEPT — short
+        exchanges are content, not noise (2026-09-01)."""
         chunks = []
         _emit_bounded(chunks, " " * 100, chunk_size=10, min_chunk_size=5)
-        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
         assert chunks == []
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
+        assert len(chunks) == 1
+        assert chunks[0]["content"] == "ab"
 
     def test_split_805_chars_at_chunk_size_800_preserves_tail(self):
         """805 chars at chunk_size=800 produces a 5-char tail. With the

@@ -28,7 +28,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize_conversations
+from .normalize import normalize_conversations_checked
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -133,6 +133,7 @@ def file_conversation_exchange(
         "ingest_mode": "convos",
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
+        "chunker_version": CONVO_CHUNKER_VERSION,
         "id_recipe": ID_RECIPE,
     }
     if extra_metadata:
@@ -159,6 +160,20 @@ CONVO_EXTENSIONS = {
 # produced 3.6k). Extends the generic SKIP_DIRS set for the convo scanner
 # only — project mining semantics are unchanged.
 CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
+
+# Version of the exchange-chunking algorithm, stamped into drawer metadata
+# as ``chunker_version`` so re-mined drawers are distinguishable from
+# old-chunker drawers. This is deliberately NOT a NORMALIZE_VERSION bump:
+# that constant is shared with miner.py / format_miner.py / closet_llm.py,
+# so bumping it would force a full re-mine (and re-embed) of every project
+# and document drawer in the palace, not just conversations. Old convo
+# drawers simply lack the field (or carry a lower value).
+#
+# v2 (2026-09-01): stopped treating '---' as an exchange terminator
+#                  (assistant text after a markdown rule was discarded)
+#                  and stopped dropping exchanges at or below
+#                  MIN_CHUNK_SIZE (short decisions vanished).
+CONVO_CHUNKER_VERSION = 2
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
@@ -250,6 +265,7 @@ def _register_file(
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
+        "chunker_version": CONVO_CHUNKER_VERSION,
         "id_recipe": ID_RECIPE,
     }
     if source_mtime is not None:
@@ -350,7 +366,14 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
             ai_lines = []
             while i < len(lines):
                 next_line = lines[i]
-                if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
+                # Only a new `> ` user turn ends the response.
+                # ``_messages_to_transcript`` (normalize.py) separates turns
+                # with blank lines and marks user turns with `> ` — it never
+                # emits `---`. Treating `---` as a terminator (removed
+                # 2026-09-01) truncated assistant messages at every markdown
+                # horizontal rule / YAML frontmatter line, and the outer loop
+                # then discarded everything up to the next `>` turn.
+                if next_line.strip().startswith(">"):
                     break
                 # Preserve the line as-is — blank lines and indentation carry meaning
                 # (paragraph breaks, list/code structure) and must survive verbatim.
@@ -378,14 +401,19 @@ def _emit_bounded(
 ) -> None:
     """Append ``content`` as one or more drawers, none exceeding ``chunk_size``.
 
-    The ``min_chunk_size`` floor gates the WHOLE call (drops the input if
-    its stripped length is at or below the floor, treated as noise). Once
-    the input passes the floor, every slice is emitted verbatim so a
-    small trailing remainder is preserved instead of silently dropped.
-    The index-based loop avoids the O(N^2) repeated-substring allocation
-    of a ``while content: content = content[chunk_size:]`` shape.
+    Only truly empty content (stripped length 0) is dropped. Short
+    exchanges are content, not noise — "> yes do it" + "Done, deployed."
+    is exactly the decision class the palace exists to keep, and the old
+    ``min_chunk_size`` floor silently discarded it (fixed 2026-09-01).
+    ``min_chunk_size`` is kept in the signature for API/config
+    compatibility, but its only remaining purpose is the zero-content
+    guard — it never drops non-empty input. Every slice is emitted
+    verbatim so a small trailing remainder is preserved instead of
+    silently dropped. The index-based loop avoids the O(N^2)
+    repeated-substring allocation of a
+    ``while content: content = content[chunk_size:]`` shape.
     """
-    if len(content.strip()) <= min_chunk_size:
+    if not content.strip():
         return
     for i in range(0, len(content), chunk_size):
         chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
@@ -729,6 +757,7 @@ def _file_chunks_locked(
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
+                        "chunker_version": CONVO_CHUNKER_VERSION,
                         "id_recipe": ID_RECIPE,
                         "chunk_total": chunk_total,
                     }
@@ -948,20 +977,30 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
+# Marker returned by _normalize_convo_conversations for structured files
+# (.json/.jsonl) that no parser recognized: the caller must skip the file
+# and count it as quarantined instead of paragraph-chunking raw JSON into
+# garbage drawers.
+_QUARANTINED = object()
+
+
 def _normalize_convo_conversations(
     filepath: Path,
     source_file: str,
-    cfg_min_chunk_size: int,
     collection,
     wing: str,
     agent: str,
     extract_mode: str,
     dry_run: bool,
-) -> Optional[list]:
+):
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
     when the caller should skip the file (normalize failed, or normalized
-    content is too short to chunk).
+    content is empty), or ``_QUARANTINED`` for a structured .json/.jsonl
+    file that no parser recognized — those must never be filed as raw
+    paragraph chunks. Quarantined files are deliberately NOT registered
+    with a sentinel: a future normalize parser (or fixed export) should
+    pick them up on the next mine instead of skipping them forever.
 
     Kept as separate conversations rather than joined into one string so
     dedup can hash and skip per conversation — a Claude.ai privacy export
@@ -970,14 +1009,31 @@ def _normalize_convo_conversations(
     whole-file hash and hides the conversations that didn't change.
     """
     try:
-        conversations = [c for c in normalize_conversations(str(filepath)) if c]
+        conversations, unparsed_structured = normalize_conversations_checked(str(filepath))
+        conversations = [c for c in conversations if c]
     except (OSError, ValueError):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
 
+    if unparsed_structured:
+        logger.warning(
+            "quarantined: %s looks like a structured chat export but no parser "
+            "recognized it — skipping instead of filing raw JSON as drawers",
+            source_file,
+        )
+        print(
+            f"  ! QUARANTINE: {filepath.name} (structured file, no parser matched)",
+            file=sys.stderr,
+        )
+        return _QUARANTINED
+
+    # Only truly empty content is unminable. Short exchanges ("> yes do it"
+    # / "Done, deployed.") are content, not noise — the old
+    # ``total_len < min_chunk_size`` gate silently dropped exactly the
+    # decision class the palace exists to keep (fixed 2026-09-01).
     total_len = sum(len(c.strip()) for c in conversations)
-    if not conversations or total_len < cfg_min_chunk_size:
+    if not conversations or total_len == 0:
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
@@ -1022,12 +1078,13 @@ def _mine_convos_impl(
     cfg_chunk_size = palace_config.chunk_size
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
     # min_chunk_size explicitly. min_chunk_size_explicit returns the
-    # validated value or None — None keeps convo's lower 30-char floor
-    # (more permissive than the 50-char project default, so short
-    # exchanges aren't dropped). Using the validated accessor (not raw
-    # _file_config) means a garbage/negative/bool config value can't
-    # TypeError the length gate below or ValueError out of
-    # chunk_exchanges and abort convo ingest.
+    # validated value or None — None keeps convo's 30-char default. Note
+    # that since 2026-09-01 min_chunk_size no longer drops non-empty
+    # conversation content (short exchanges are content, not noise); the
+    # value is still validated and threaded through so chunk_exchanges'
+    # parameter checks stay meaningful. Using the validated accessor (not
+    # raw _file_config) means a garbage/negative/bool config value can't
+    # ValueError out of chunk_exchanges and abort convo ingest.
     explicit_min = palace_config.min_chunk_size_explicit
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
@@ -1076,6 +1133,7 @@ def _mine_convos_impl(
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
+    files_quarantined = 0
     files_processed = 0
     room_counts = defaultdict(int)
 
@@ -1102,13 +1160,15 @@ def _mine_convos_impl(
         conversations = _normalize_convo_conversations(
             filepath,
             source_file,
-            cfg_min_chunk_size,
             collection,
             wing,
             agent,
             extract_mode,
             dry_run,
         )
+        if conversations is _QUARANTINED:
+            files_quarantined += 1
+            continue
         if conversations is None:
             continue
 
@@ -1218,10 +1278,25 @@ def _mine_convos_impl(
         _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
         _validate_palace_fts5_after_mine(palace_path)
 
+    _print_mine_summary(
+        files_processed, files_skipped, files_quarantined, total_drawers, room_counts
+    )
+
+
+def _print_mine_summary(
+    files_processed: int,
+    files_skipped: int,
+    files_quarantined: int,
+    total_drawers: int,
+    room_counts: dict,
+) -> None:
+    """Render the end-of-mine summary block."""
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
+    print(f"  Files processed: {files_processed - files_skipped - files_quarantined}")
     print(f"  Files skipped (already filed): {files_skipped}")
+    if files_quarantined:
+        print(f"  Files quarantined (unparseable structured): {files_quarantined}")
     print(f"  Drawers filed: {total_drawers}")
     if room_counts:
         print("\n  By room:")

@@ -204,22 +204,39 @@ def normalize_conversations(filepath: str) -> list:
     always normalize to one conversation, so this returns a one-element
     list for those — identical dedup granularity to before.
     """
+    return normalize_conversations_checked(filepath)[0]
+
+
+def normalize_conversations_checked(filepath: str) -> tuple[list, bool]:
+    """Like :func:`normalize_conversations`, but also reports whether the
+    file is an unparseable structured export.
+
+    Returns ``(conversations, unparsed_structured)``. The flag is True
+    only for ``.json`` / ``.jsonl`` files that look like chat exports but
+    were declined by every parser — for those, ``conversations`` is still
+    the raw file text (one element) for backward compatibility, but
+    callers such as the convo miner should QUARANTINE the file instead of
+    paragraph-chunking serialized JSON into garbage drawers. Plain
+    ``.txt`` / ``.md`` files never set the flag: the raw paragraph path
+    is the intended behavior for them.
+    """
     content = _read_transcript_file(filepath)
 
     if not content.strip():
-        return []
+        return [], False
 
     lines = content.split("\n")
     if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
-        return [content]
+        return [content], False
 
     ext = Path(filepath).suffix.lower()
-    if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
+    structured = ext in (".json", ".jsonl")
+    if structured or content.strip()[:1] in ("{", "["):
         split = _try_normalize_json_split(content)
         if split:
-            return split
+            return split, False
 
-    return [content]
+    return [content], structured
 
 
 def _try_normalize_json(content: str) -> Optional[str]:
