@@ -22,6 +22,8 @@ LOGSTREAM_TOOLS = frozenset(
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
+        "mempalace_event_cursor_get",
+        "mempalace_event_cursor_set",
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
@@ -32,6 +34,7 @@ LOGSTREAM_MUTATING = frozenset(
         "mempalace_event_append",
         "mempalace_task_create",
         "mempalace_event_ack",
+        "mempalace_event_cursor_set",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
     }

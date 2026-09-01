@@ -2238,6 +2238,93 @@ def _watch_spec(args, as_json) -> dict:
     return spec
 
 
+def _watch_store_cursor(ls, args, as_json, cursor):
+    """Resolve ``watch --cursor-from-store`` against the durable cursor store.
+
+    Durable per-agent cursor store (RFC 003): resume from the id the agent
+    last recorded via ``logstream cursor set`` / the MCP cursor tools, so the
+    documented watch loop needs no hand-carried ids. An explicit
+    --since-event-id and an existing state-file checkpoint both outrank it:
+    they describe THIS watcher's position, while the store describes the
+    agent's last processed inbox sweep. Returns (cursor, store_corrupt);
+    a corrupt store record forces a replay-from-start rather than a tip jump
+    past events the agent never saw.
+    """
+    if cursor is not None or not getattr(args, "cursor_from_store", False):
+        return cursor, False
+    from .logstream_cursors import cursor_get
+
+    if not args.agent:
+        _logstream_fail("--cursor-from-store requires --agent", as_json)
+    try:
+        record = cursor_get(ls.db_path, args.agent)
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+    if record is not None and record.get("corrupt"):
+        print(
+            f"Stored cursor for {args.agent} is unreadable; replaying from the start "
+            "rather than skipping to the tip.",
+            file=sys.stderr,
+        )
+        return None, True
+    if record is not None:
+        return record["event_id"], False
+    return None, False
+
+
+def _logstream_ack(ls, args, as_json):
+    """Run ``logstream ack`` — append an event.ack (never mutates the target)."""
+    import json
+
+    try:
+        event = ls.ack_event(
+            args.event_id,
+            from_agent=args.from_agent,
+            status=args.status,
+            body=args.body or "",
+            topic=getattr(args, "topic", None),
+        )
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(event, indent=2, ensure_ascii=False))
+    else:
+        print("Acknowledged:")
+        _print_event_line(event)
+
+
+def _logstream_cursor(ls, args, as_json):
+    """Run ``logstream cursor get|set`` — the durable per-agent resume cursor."""
+    import json
+
+    from .logstream_cursors import cursor_get, cursor_set
+
+    if args.cursor_action == "set":
+        if not args.event_id:
+            _logstream_fail("cursor set requires --event-id", as_json)
+        try:
+            record = cursor_set(ls.db_path, args.agent, args.event_id)
+        except (ValueError, OSError) as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(record, indent=2, ensure_ascii=False))
+        else:
+            print(f"Cursor for {args.agent}: {record['event_id']}")
+        return
+    try:
+        record = cursor_get(ls.db_path, args.agent)
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps({"agent": args.agent, "cursor": record}, ensure_ascii=False))
+    elif record is None:
+        print(f"No cursor stored for {args.agent}.")
+    elif record.get("corrupt"):
+        print(f"Cursor for {args.agent} is unreadable (corrupt state file).")
+    else:
+        print(f"Cursor for {args.agent}: {record['event_id']}")
+
+
 def _logstream_watch(ls, args, as_json):
     """Run ``logstream watch`` — block until interesting events arrive.
 
@@ -2268,8 +2355,14 @@ def _logstream_watch(ls, args, as_json):
     # it — the loss is silent and permanent.
     recovery_failed = state_condition == WATCH_STATE_CORRUPT
     cursor = args.since_event_id or stored_cursor
+    cursor, store_corrupt = _watch_store_cursor(ls, args, as_json, cursor)
     skipped_from = None
-    if cursor is None and not args.from_start and state_condition == WATCH_STATE_ABSENT:
+    if (
+        cursor is None
+        and not args.from_start
+        and not store_corrupt
+        and state_condition == WATCH_STATE_ABSENT
+    ):
         # Start at the tip, like the SSE live-tail does at connect time.
         # Starting from the beginning of a long fleet log means a fresh
         # watcher wakes holding weeks of history and cannot tell it is
@@ -2490,6 +2583,8 @@ def cmd_logstream(args):
                 sys.exit(2)
         elif args.logstream_action == "watch":
             _logstream_watch(ls, args, as_json)
+        elif args.logstream_action == "cursor":
+            _logstream_cursor(ls, args, as_json)
         elif args.logstream_action == "sync":
             from .logsync import load_peers, sync_all, sync_with_peer
 
@@ -2525,21 +2620,7 @@ def cmd_logstream(args):
             if any(s.get("error") for s in results):
                 sys.exit(1)
         elif args.logstream_action == "ack":
-            try:
-                event = ls.ack_event(
-                    args.event_id,
-                    from_agent=args.from_agent,
-                    status=args.status,
-                    body=args.body or "",
-                    topic=getattr(args, "topic", None),
-                )
-            except ValueError as exc:
-                _logstream_fail(str(exc), as_json)
-            if as_json:
-                print(json.dumps(event, indent=2, ensure_ascii=False))
-            else:
-                print("Acknowledged:")
-                _print_event_line(event)
+            _logstream_ack(ls, args, as_json)
     finally:
         ls.close()
 
@@ -4366,6 +4447,15 @@ def main():
         help="Persist the cursor here so a restart resumes exactly where it stopped",
     )
     p_ls_watch.add_argument(
+        "--cursor-from-store",
+        action="store_true",
+        help=(
+            "Resume from the durable per-agent cursor store next to the logstream db "
+            "(set via `mempalace logstream cursor set`); requires --agent. "
+            "--since-event-id and an existing --state-file cursor take precedence"
+        ),
+    )
+    p_ls_watch.add_argument(
         "--from-start",
         action="store_true",
         help=(
@@ -4394,6 +4484,17 @@ def main():
         "--limit", type=int, default=50, help="Max events per poll (default 50)"
     )
     p_ls_watch.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_cursor = logstream_sub.add_parser(
+        "cursor",
+        help="Durable per-agent resume cursor (last-processed event id), stored next to the logstream db",
+    )
+    p_ls_cursor.add_argument("cursor_action", choices=["get", "set"], help="get or set")
+    p_ls_cursor.add_argument("--agent", required=True, help="Agent identity owning the cursor")
+    p_ls_cursor.add_argument(
+        "--event-id", default=None, help="Last-processed event id (required for set)"
+    )
+    p_ls_cursor.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_ls_ack = logstream_sub.add_parser(
         "ack", help="Acknowledge an event (appends event.ack, never mutates)"
