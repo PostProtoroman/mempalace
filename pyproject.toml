@@ -71,6 +71,16 @@ sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 # (``mempalace-source-cursor``, ``mempalace-source-git``, …) register here.
 [project.entry-points."mempalace.sources"]
 
+# Hermes memory-provider plugin. Hermes' loader (hermes-agent
+# ``plugins/memory/__init__.py``) scans this exact entry-point group for
+# pip-installed providers, so ``pip install mempalace`` alone makes
+# ``memory.provider: mempalace`` resolvable — no manual copy into
+# ``~/.hermes/plugins/`` required (``mempalace hermes-install`` still
+# offers the directory install for setups that want the dashboard
+# config panel a directory plugin gets).
+[project.entry-points."hermes_agent.memory_providers"]
+mempalace = "mempalace.integrations.hermes:MempalaceProvider"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",

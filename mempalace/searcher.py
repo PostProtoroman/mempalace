@@ -2027,6 +2027,7 @@ def search_memories(
     candidate_strategy: str = DEFAULT_CANDIDATE_STRATEGY,
     collection_name: str = None,
     lang: Optional[str] = None,
+    collection=None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -2108,9 +2109,19 @@ def search_memories(
     if short_circuit is not None:
         return short_circuit
 
-    drawers_col, open_error = _open_search_collection(palace_path, collection_name)
-    if open_error:
-        return open_error
+    # ``collection`` lets a caller that already holds an open collection on a
+    # long-lived client (e.g. the Hermes provider — see its single-client
+    # design note) reuse it instead of this function constructing a second
+    # PersistentClient against the same palace, which races Chroma's local
+    # SQLite. When provided, the closet-boost side collection is also skipped
+    # — hybrid degrades gracefully to drawer-only search, exactly as it does
+    # when no closets exist yet.
+    if collection is not None:
+        drawers_col = collection
+    else:
+        drawers_col, open_error = _open_search_collection(palace_path, collection_name)
+        if open_error:
+            return open_error
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
@@ -2144,10 +2155,11 @@ def search_memories(
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
-        closet_boost_by_source = _closet_boosts(
-            closets_col, query=query, n_results=n_results, where=where
-        )
+        if collection is None:
+            closets_col = get_closets_collection(palace_path, create=False)
+            closet_boost_by_source = _closet_boosts(
+                closets_col, query=query, n_results=n_results, where=where
+            )
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
         logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
