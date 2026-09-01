@@ -140,13 +140,15 @@ def test_dedup_source_group_all_unique():
     assert len(deleted) == 0
 
 
-def test_dedup_source_group_with_duplicate():
+def test_dedup_source_group_with_near_duplicate():
+    """Same length but different text, reported as near (below threshold) by
+    the similarity search -- a real mining artifact, not an exact repeat."""
     col = MagicMock()
     col.get.return_value = {
         "ids": ["d1", "d2"],
         "documents": [
-            "long document content that is fairly long",
-            "long document content that is fairly long",
+            "long document content that is fairly long!",
+            "long document content that is fairly long?",
         ],
         "metadatas": [{"wing": "a"}, {"wing": "a"}],
     }
@@ -159,23 +161,102 @@ def test_dedup_source_group_with_duplicate():
     assert len(deleted) == 1
 
 
-def test_dedup_source_group_short_docs_deleted():
+def test_dedup_source_group_exact_duplicate_content_is_protected():
+    """Byte-identical content is a deliberate verbatim repeat (per
+    ids.py's filed_at-based id scheme) -- the module must NOT delete it,
+    even though it is reported as maximally near (distance 0)."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": [
+            "long document content that is fairly long",
+            "long document content that is fairly long",
+        ],
+        "metadatas": [{"wing": "a"}, {"wing": "a"}],
+    }
+    col.query.return_value = {
+        "ids": [["d1"]],
+        "distances": [[0.0]],
+    }
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert deleted == []
+    assert set(kept) == {"d1", "d2"}
+
+
+def test_dedup_source_group_short_docs_survive_when_unique():
+    """Short-but-unique drawers are real content, not a mining artifact --
+    the module no longer deletes purely for being under 20 chars."""
     col = MagicMock()
     col.get.return_value = {
         "ids": ["d1", "d2"],
         "documents": ["long enough document to keep in the palace", "tiny"],
         "metadatas": [{"wing": "a"}, {"wing": "a"}],
     }
+    col.query.return_value = {
+        "ids": [["d1"]],
+        "distances": [[0.8]],  # far apart = unique
+    }
     kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
-    assert "d2" in deleted  # too short
+    assert "d2" in kept
+    assert deleted == []
 
 
-def test_dedup_source_group_empty_doc_deleted():
+def test_dedup_source_group_empty_doc_survives():
+    """A drawer with no document text has nothing to compare -- it is kept,
+    never auto-deleted."""
     col = MagicMock()
     col.get.return_value = {
         "ids": ["d1", "d2"],
         "documents": ["real document content here that is long enough", None],
         "metadatas": [{"wing": "a"}, {"wing": "a"}],
+    }
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert "d2" in kept
+    assert deleted == []
+
+
+def test_dedup_source_group_exact_repeat_survives():
+    """Two drawers with byte-identical content are a deliberate verbatim
+    repeat (distinguished from a mining artifact by filed_at, per
+    ids.py's make_exchange_drawer_id) -- never deleted, even though the
+    similarity search reports them as near (distance 0)."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": [
+            "the exact same words said twice on two different days",
+            "the exact same words said twice on two different days",
+        ],
+        "metadatas": [
+            {"wing": "a", "filed_at": "2026-01-01T00:00:00"},
+            {"wing": "a", "filed_at": "2026-06-01T00:00:00"},
+        ],
+    }
+    col.query.return_value = {
+        "ids": [["d1"]],
+        "distances": [[0.0]],  # identical text -> distance 0
+    }
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert deleted == []
+    assert set(kept) == {"d1", "d2"}
+
+
+def test_dedup_source_group_near_dup_not_exact_still_deleted():
+    """A near-duplicate that is NOT an exact text match (a real mining
+    artifact -- same content, slightly different chunk boundary) is still
+    eligible for deletion."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": [
+            "long document content that is fairly long and rich!",
+            "long document content that is fairly long and rich?",
+        ],
+        "metadatas": [{"wing": "a"}, {"wing": "a"}],
+    }
+    col.query.return_value = {
+        "ids": [["d1"]],
+        "distances": [[0.05]],
     }
     kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
     assert "d2" in deleted
@@ -185,7 +266,7 @@ def test_dedup_source_group_live_deletes():
     col = MagicMock()
     col.get.return_value = {
         "ids": ["d1", "d2"],
-        "documents": ["long document content here enough", "long document content here enough"],
+        "documents": ["long document content here enough!", "long document content here enough?"],
         "metadatas": [{"wing": "a"}, {"wing": "a"}],
     }
     col.query.return_value = {

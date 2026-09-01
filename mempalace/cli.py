@@ -1945,13 +1945,34 @@ def cmd_restore(args):
 
 def cmd_hallways(args):
     """List within-wing entity hallways (the auto-built associative graph)."""
-    from .hallways import list_hallways
+    from .hallways import list_hallways, prune_hallways
 
     palace_path = (
         os.path.expanduser(args.palace)
         if getattr(args, "palace", None)
         else MempalaceConfig().palace_path
     )
+    config = MempalaceConfig(palace_path=palace_path)
+
+    if getattr(args, "hallways_action", None) == "prune":
+        summary = prune_hallways(
+            threshold=args.threshold,
+            wing=getattr(args, "wing", None),
+            dry_run=not args.apply,
+            config=config,
+        )
+        mode = "DRY RUN" if summary["dry_run"] else "LIVE"
+        print(f"  Hallway prune ({mode}) -- threshold: {summary['threshold']} co-occurrences")
+        if summary["wing"]:
+            print(f"  Wing: {summary['wing']}")
+        verb = "Would remove" if summary["dry_run"] else "Removed"
+        print(f"  {verb}: {summary['removed_count']} / {summary['total']} hallway(s)")
+        print(f"  Kept: {summary['kept_count']}")
+        print(f"  Estimated bytes saved: {summary['estimated_bytes_saved']:,}")
+        if summary["dry_run"] and summary["removed_count"]:
+            print("\n  [DRY RUN] No changes written. Re-run with --apply to prune.")
+        return
+
     rows = list_hallways(
         getattr(args, "wing", None),
         config=MempalaceConfig(palace_path=palace_path),
@@ -1964,6 +1985,27 @@ def cmd_hallways(args):
     for h in rows[: max(0, args.limit)]:
         label = h.get("label") or f"{h.get('entity_a', '?')} <-> {h.get('entity_b', '?')}"
         print(f"    {label}")
+
+
+def cmd_dedup(args):
+    """Find (and, with --apply, remove) near-duplicate drawers. Dry-run by default."""
+    from .dedup import DEFAULT_THRESHOLD, dedup_palace, show_stats
+
+    palace_path = (
+        os.path.expanduser(args.palace)
+        if getattr(args, "palace", None)
+        else MempalaceConfig().palace_path
+    )
+    if getattr(args, "stats", False):
+        show_stats(palace_path=palace_path)
+        return
+    dedup_palace(
+        palace_path=palace_path,
+        threshold=args.threshold if args.threshold is not None else DEFAULT_THRESHOLD,
+        dry_run=not args.apply,
+        source_pattern=args.source,
+        wing=args.wing,
+    )
 
 
 def cmd_status(args):
@@ -4079,6 +4121,39 @@ def main():
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
+    hallways_sub = p_hallways.add_subparsers(dest="hallways_action")
+    p_hallways_prune = hallways_sub.add_parser(
+        "prune", help="Drop noise hallways below a co-occurrence threshold (dry-run by default)"
+    )
+    p_hallways_prune.add_argument("--wing", default=None, help="Scope pruning to one wing")
+    p_hallways_prune.add_argument(
+        "--threshold",
+        type=int,
+        default=3,
+        help="Drop pairs seen in fewer than this many drawers (default: 3)",
+    )
+    p_hallways_prune.add_argument(
+        "--apply", action="store_true", help="Actually remove them. Without this, preview only."
+    )
+
+    p_dedup = sub.add_parser(
+        "dedup", help="Find/remove near-duplicate drawers (dry-run by default)"
+    )
+    p_dedup.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Cosine distance threshold (default: 0.15)",
+    )
+    p_dedup.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete duplicates. Without this, preview only.",
+    )
+    p_dedup.add_argument("--stats", action="store_true", help="Show duplication stats only")
+    p_dedup.add_argument("--wing", default=None, help="Scope dedup to a single wing")
+    p_dedup.add_argument("--source", default=None, help="Filter by source file pattern")
+
     p_status = sub.add_parser("status", help="Show what's been filed")
     p_status.add_argument(
         "--backend",
@@ -4479,6 +4554,7 @@ def main():
         "backup": cmd_backup,
         "restore": cmd_restore,
         "hallways": cmd_hallways,
+        "dedup": cmd_dedup,
         "status": cmd_status,
         "update": cmd_update,
     }

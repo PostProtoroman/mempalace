@@ -3,17 +3,30 @@ dedup.py — Detect and remove near-duplicate drawers
 ====================================================
 
 When the same files are mined multiple times, near-identical drawers
-accumulate. This module finds drawers from the same source_file that
-are too similar (cosine distance < threshold), keeps the longest/richest
-version, and deletes the rest.
+accumulate as a mining artifact (the same chunk re-ingested, boundaries
+shifted by a few characters). This module finds drawers from the same
+source_file that are too similar (cosine distance < threshold), keeps the
+longest/richest version, and deletes the rest of that ids-collision class.
+
+It does NOT delete genuinely repeated content. Per ``ids.py``'s
+``make_exchange_drawer_id`` docstring, ``filed_at`` is baked into the
+drawer id specifically so that saying the same thing twice files two
+distinct drawers -- "verbatim always: repetition is signal, not noise"
+(CLAUDE.md). So a candidate whose document text is an EXACT match for an
+already-kept drawer is a deliberate repeat, not a mining artifact, and is
+never deleted here -- regardless of distance.
 
 Uses the configured storage backend's similarity search. With the default
 local backends (Chroma, sqlite_exact) this stays on-machine with no external
 calls; with a remote backend (e.g. Qdrant) it issues queries to that backend.
 
+Dry-run is the default everywhere in this module (standalone script, CLI,
+and ``dedup_palace``/``dedup_source_group`` themselves) -- nothing is ever
+deleted unless the caller opts in with ``--apply`` / ``dry_run=False``.
+
 Usage (standalone):
-    python -m mempalace.dedup                          # dedup all
-    python -m mempalace.dedup --dry-run                # preview only
+    python -m mempalace.dedup                          # preview (dry-run, default)
+    python -m mempalace.dedup --apply                  # actually delete
     python -m mempalace.dedup --threshold 0.10         # stricter (near-identical only)
     python -m mempalace.dedup --threshold 0.35         # looser (catches paraphrased content)
     python -m mempalace.dedup --wing my_project        # scope to one wing
@@ -21,7 +34,7 @@ Usage (standalone):
     python -m mempalace.dedup --source "my_project"    # filter by source
 
 Usage (from CLI):
-    mempalace dedup [--dry-run] [--threshold 0.15] [--stats]
+    mempalace dedup [--apply] [--threshold 0.15] [--stats]
 """
 
 import argparse
@@ -99,7 +112,18 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
     """Dedup drawers within one source_file group.
 
     Greedy: sort by doc length (longest first), keep if not too similar
-    to any already-kept drawer. Returns (kept_ids, deleted_ids).
+    to any already-kept drawer. A candidate is only ever marked for
+    deletion when it is a near-duplicate (distance < threshold) of an
+    already-kept drawer AND its text is not an exact match for that
+    kept drawer -- an exact match is a deliberate verbatim repeat
+    (distinguished from a mining artifact by ``filed_at`` per
+    ``ids.py``'s ``make_exchange_drawer_id``) and is always preserved.
+
+    Short documents are never auto-deleted just for being short -- a
+    short-but-unique drawer is real content, not a mining artifact.
+
+    Returns (kept_ids, deleted_ids). Nothing is written unless
+    ``dry_run=False``.
     """
     data = col.get(ids=drawer_ids, include=["documents", "metadatas"])
     items = list(zip(data["ids"], data["documents"], data["metadatas"]))
@@ -109,8 +133,9 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
     to_delete = []
 
     for did, doc, _meta in items:
-        if not doc or len(doc) < 20:
-            to_delete.append(did)
+        if not doc:
+            # No text to compare -- nothing to prove it's a duplicate of.
+            kept.append((did, doc))
             continue
 
         if not kept:
@@ -124,13 +149,18 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
                 include=["distances"],
             )
             dists = results["distances"][0] if results["distances"] else []
-            kept_ids_set = {k[0] for k in kept}
+            kept_docs_by_id = {k[0]: k[1] for k in kept}
 
             is_dup = False
             for rid, dist in zip(results["ids"][0], dists):
-                if rid in kept_ids_set and dist < threshold:
-                    is_dup = True
-                    break
+                if rid not in kept_docs_by_id or dist >= threshold:
+                    continue
+                if kept_docs_by_id[rid] == doc:
+                    # Exact text match against a kept drawer: a deliberate
+                    # verbatim repeat, not a mining artifact. Never delete.
+                    continue
+                is_dup = True
+                break
 
             if is_dup:
                 to_delete.append(did)
@@ -249,7 +279,16 @@ if __name__ == "__main__":
         default=DEFAULT_THRESHOLD,
         help=f"Cosine distance threshold (default: {DEFAULT_THRESHOLD})",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Preview without deleting")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete duplicates. Without this, dedup only previews (default).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview only (default behavior; kept for backwards compatibility)",
+    )
     parser.add_argument("--stats", action="store_true", help="Show stats only")
     parser.add_argument("--wing", default=None, help="Scope dedup to a single wing")
     parser.add_argument("--source", default=None, help="Filter by source file pattern")
@@ -263,7 +302,7 @@ if __name__ == "__main__":
         dedup_palace(
             palace_path=path,
             threshold=args.threshold,
-            dry_run=args.dry_run,
+            dry_run=not args.apply,
             source_pattern=args.source,
             wing=args.wing,
         )

@@ -59,7 +59,48 @@ __all__ = [
     "compute_hallways_for_wing",
     "list_hallways",
     "delete_hallway",
+    "prune_hallways",
 ]
+
+# Default prune threshold: pairs seen together in fewer than this many
+# drawers are noise (a coincidental co-mention), not a real association.
+DEFAULT_PRUNE_THRESHOLD = 3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-process parse cache — the store is a single JSON file, fully parsed
+# and rewritten on every read/write today (#hallways-perf). Rewriting the
+# storage format (e.g. sqlite) is out of scope here; this is the cheap
+# half: avoid re-parsing the same file repeatedly within one process.
+# Keyed by resolved path, invalidated by mtime so an external write (or a
+# write from another process) is still picked up. ``_save_hallways``
+# updates the cache directly after a successful write instead of relying
+# on a subsequent stat+reparse.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PARSE_CACHE: dict[str, tuple[Optional[float], list[dict]]] = {}
+
+
+def _cache_get(path: str) -> Optional[list[dict]]:
+    entry = _PARSE_CACHE.get(path)
+    if entry is None:
+        return None
+    cached_mtime, data = entry
+    try:
+        current_mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if cached_mtime == current_mtime:
+        return list(data)
+    return None
+
+
+def _cache_set(path: str, data: list[dict]) -> None:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _PARSE_CACHE.pop(path, None)
+        return
+    _PARSE_CACHE[path] = (mtime, list(data))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +137,9 @@ def _load_hallways(config=None) -> list[dict]:
     """
     current_hallway_file = _get_hallway_file(config)
     if os.path.exists(current_hallway_file):
+        cached = _cache_get(current_hallway_file)
+        if cached is not None:
+            return cached
         try:
             with open(current_hallway_file, encoding="utf-8") as f:
                 raw = json.load(f)
@@ -103,10 +147,13 @@ def _load_hallways(config=None) -> list[dict]:
             logger.debug("hallways: load failed, treating as empty", exc_info=True)
             return []
         if isinstance(raw, dict) and "hallways" in raw:
-            return raw.get("hallways") or []
-        if isinstance(raw, list):
-            return raw
-        return []
+            data = raw.get("hallways") or []
+        elif isinstance(raw, list):
+            data = raw
+        else:
+            data = []
+        _cache_set(current_hallway_file, data)
+        return list(data)
 
     legacy = _legacy_hallway_file()
     if legacy != current_hallway_file and os.path.exists(legacy):
@@ -150,6 +197,8 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
         except OSError:
             pass
         raise
+    else:
+        _cache_set(hallway_file, payload["hallways"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,3 +440,69 @@ def delete_hallway(hallway_id: str, config=None) -> bool:
         return False
     _save_hallways(filtered, config)
     return True
+
+
+def prune_hallways(
+    threshold: int = DEFAULT_PRUNE_THRESHOLD,
+    wing: Optional[str] = None,
+    dry_run: bool = True,
+    config=None,
+) -> dict:
+    """Drop hallway records whose co-occurrence count is below ``threshold``.
+
+    The live store accumulates noise pairs -- entities that happened to
+    co-occur in only one or two drawers -- which dominate the file without
+    carrying real associative signal. This prunes them.
+
+    Dry-run by default: nothing is written unless ``dry_run=False``. Scope
+    to one wing with ``wing``; omit to consider the whole store.
+
+    Returns a summary dict:
+        {
+            "total": total records considered (in scope),
+            "threshold": threshold used,
+            "wing": wing filter (or None),
+            "removed_count": records that were/would be removed,
+            "kept_count": records that remain,
+            "estimated_bytes_saved": estimated JSON size reduction,
+            "dry_run": whether this was a preview,
+        }
+    """
+    threshold = max(0, int(threshold))
+    all_hallways = _load_hallways(config)
+
+    def _in_scope(h):
+        return wing is None or h.get("wing") == wing
+
+    below_threshold_ids = {
+        h.get("id")
+        for h in all_hallways
+        if _in_scope(h) and h.get("co_occurrence_count", 0) < threshold
+    }
+
+    kept = [h for h in all_hallways if h.get("id") not in below_threshold_ids]
+    removed = [h for h in all_hallways if h.get("id") in below_threshold_ids]
+
+    before_bytes = len(
+        json.dumps(
+            {"schema_version": _SCHEMA_VERSION, "hallways": all_hallways}, ensure_ascii=False
+        )
+    )
+    after_bytes = len(
+        json.dumps({"schema_version": _SCHEMA_VERSION, "hallways": kept}, ensure_ascii=False)
+    )
+
+    summary = {
+        "total": sum(1 for h in all_hallways if _in_scope(h)),
+        "threshold": threshold,
+        "wing": wing,
+        "removed_count": len(removed),
+        "kept_count": len(kept),
+        "estimated_bytes_saved": max(0, before_bytes - after_bytes),
+        "dry_run": dry_run,
+    }
+
+    if not dry_run and removed:
+        _save_hallways(kept, config)
+
+    return summary

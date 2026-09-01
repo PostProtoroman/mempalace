@@ -508,3 +508,136 @@ class TestHallwayDynamicsIntegration:
         )
         assert after[0]["access_count"] == 33
         assert after[0]["stability"] == 1.9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prune_hallways — drop noise pairs below a co-occurrence threshold
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _sample_hallway(hid, wing, count, entity_a="A", entity_b="B"):
+    return {
+        "id": hid,
+        "wing": wing,
+        "entity_a": entity_a,
+        "entity_b": entity_b,
+        "co_occurrence_count": count,
+        "rooms": ["diary"],
+        "label": f"{entity_a} <-> {entity_b}",
+    }
+
+
+class TestPruneHallways:
+    def test_dry_run_removes_nothing(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [
+            _sample_hallway("h1", "w", 1),
+            _sample_hallway("h2", "w", 2),
+            _sample_hallway("h3", "w", 10),
+        ]
+        hallways_mod._save_hallways(sample)
+
+        summary = hallways_mod.prune_hallways(threshold=3, dry_run=True)
+
+        assert summary["removed_count"] == 2
+        assert summary["kept_count"] == 1
+        assert summary["dry_run"] is True
+        # Nothing actually written.
+        assert hallways_mod._load_hallways() == sample
+
+    def test_apply_removes_below_threshold(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [
+            _sample_hallway("h1", "w", 1),
+            _sample_hallway("h2", "w", 2),
+            _sample_hallway("h3", "w", 10),
+        ]
+        hallways_mod._save_hallways(sample)
+
+        summary = hallways_mod.prune_hallways(threshold=3, dry_run=False)
+
+        assert summary["removed_count"] == 2
+        remaining = hallways_mod._load_hallways()
+        assert [h["id"] for h in remaining] == ["h3"]
+
+    def test_scoped_to_wing(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [
+            _sample_hallway("h1", "wing_a", 1),
+            _sample_hallway("h2", "wing_b", 1),
+        ]
+        hallways_mod._save_hallways(sample)
+
+        summary = hallways_mod.prune_hallways(threshold=3, wing="wing_a", dry_run=False)
+
+        assert summary["removed_count"] == 1
+        remaining = hallways_mod._load_hallways()
+        assert [h["id"] for h in remaining] == ["h2"]
+
+    def test_estimated_bytes_saved_is_positive_when_something_removed(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [_sample_hallway("h1", "w", 1), _sample_hallway("h2", "w", 10)]
+        hallways_mod._save_hallways(sample)
+
+        summary = hallways_mod.prune_hallways(threshold=3, dry_run=True)
+        assert summary["estimated_bytes_saved"] > 0
+
+    def test_nothing_below_threshold_is_a_no_op(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [_sample_hallway("h1", "w", 10)]
+        hallways_mod._save_hallways(sample)
+
+        summary = hallways_mod.prune_hallways(threshold=3, dry_run=False)
+        assert summary["removed_count"] == 0
+        assert hallways_mod._load_hallways() == sample
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parse cache — avoid re-parsing the same hallway file repeatedly
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestParseCache:
+    def test_repeated_loads_do_not_reparse_file(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [_sample_hallway("h1", "w", 5)]
+        hallways_mod._save_hallways(sample)
+
+        real_open = open
+        open_calls = []
+
+        def counting_open(path, *args, **kwargs):
+            open_calls.append(path)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", counting_open)
+
+        first = hallways_mod._load_hallways()
+        second = hallways_mod._load_hallways()
+        third = hallways_mod._load_hallways()
+
+        assert first == second == third == sample
+        # The file must not be re-opened/re-parsed on every call once cached.
+        assert len(open_calls) == 0
+
+    def test_external_write_invalidates_cache(self, tmp_path, monkeypatch):
+        """If the file's mtime changes (e.g. another process wrote it), the
+        cache must not serve stale data."""
+        import json as json_mod
+        import time
+
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        sample = [_sample_hallway("h1", "w", 5)]
+        hallways_mod._save_hallways(sample)
+        assert hallways_mod._load_hallways() == sample
+
+        # Simulate an external rewrite with a distinct, later mtime.
+        new_data = {"schema_version": 1, "hallways": [_sample_hallway("h2", "w", 9)]}
+        hallway_file.write_text(json_mod.dumps(new_data), encoding="utf-8")
+        future = time.time() + 5
+        import os as os_mod
+
+        os_mod.utime(str(hallway_file), (future, future))
+
+        reloaded = hallways_mod._load_hallways()
+        assert [h["id"] for h in reloaded] == ["h2"]
