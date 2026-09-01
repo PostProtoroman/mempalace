@@ -4419,6 +4419,15 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     that reads are case-insensitive (see #1243). Entries written under
     pre-fix mixed-case agent names will not match the lowercase filter;
     use ``mempalace repair`` to migrate legacy data if needed.
+
+    Alias resolution: when ``config.json``'s ``identity.aliases`` maps
+    ``agent_name`` (as a canonical identity) to one or more alias names —
+    e.g. a Claude Code harness writing checkpoints under ``"claude"`` while
+    the shared-brain protocol addresses it as ``"mac-claude"`` — entries
+    filed under any configured alias are included too, merged chronologically
+    with the canonical entries. This is read-only: writes are never
+    redirected, so history stays exactly where it was filed (use
+    ``mempalace identity-migrate`` to re-key it).
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
@@ -4431,10 +4440,20 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     if not col:
         return _collection_error_or_no_palace()
 
-    # Build filter: always scope by agent + room=diary. Wing is optional —
-    # when empty, return entries across all wings for this agent (matches
-    # the #1097 empty-string-as-no-filter convention for LLM ergonomics).
-    conditions = [{"room": "diary"}, {"agent": agent_name}]
+    try:
+        aliases = _config.aliases_for_identity(agent_name)
+    except Exception:
+        aliases = []
+    agent_names = [agent_name, *[a for a in aliases if a != agent_name]]
+
+    # Build filter: always scope by agent (+ its configured aliases) and
+    # room=diary. Wing is optional — when empty, return entries across all
+    # wings for this agent (matches the #1097 empty-string-as-no-filter
+    # convention for LLM ergonomics).
+    agent_condition = (
+        {"agent": agent_names[0]} if len(agent_names) == 1 else {"agent": {"$in": agent_names}}
+    )
+    conditions = [{"room": "diary"}, agent_condition]
     if wing:
         conditions.insert(0, {"wing": wing})
 

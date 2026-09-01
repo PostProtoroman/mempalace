@@ -612,6 +612,96 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     return True
 
 
+def plan_identity_renames(items, alias_to_canonical: dict):
+    """Pure planner over diary ``(id, metadata)`` pairs.
+
+    ``alias_to_canonical`` maps each alias identity (lowercase) to its
+    canonical identity (lowercase) -- the inverse of
+    ``MempalaceConfig.identity_aliases``. Only ``room == "diary"`` records
+    whose ``agent`` metadata matches a configured alias are planned; every
+    other record (including drawer text) is left untouched, per RFC 005's
+    "writes are not redirected" rule -- this command only catches up
+    metadata filed *before* the alias was configured or before a prior
+    partial migration.
+
+    Returns ``(summary, updates)`` where ``summary`` is
+    ``{(alias, canonical): count}`` and ``updates`` is
+    ``[(id, new_metadata), ...]``. Metadata is copied; only the ``agent``
+    key is rewritten -- never the document text.
+    """
+    summary = defaultdict(int)
+    updates = []
+    for rec_id, meta in items:
+        meta = dict(meta or {})
+        if meta.get("room") != "diary":
+            continue
+        current = str(meta.get("agent") or "").strip().lower()
+        canonical = alias_to_canonical.get(current)
+        if not canonical or canonical == current:
+            continue
+        summary[(current, canonical)] += 1
+        meta["agent"] = canonical
+        updates.append((rec_id, meta))
+    return summary, updates
+
+
+def migrate_identity_aliases(
+    palace_path: str, config=None, dry_run: bool = True, apply: bool = False
+) -> bool:
+    """Re-key diary drawers filed under a configured alias to their canonical
+    identity (docs/rfcs/005-agent-identity-routing.md, #1693 follow-up).
+
+    Metadata-only: rewrites the ``agent`` field on diary drawers in place
+    (ids and document text untouched). Reads are already alias-merged at
+    query time (``tool_diary_read``), so this is a convenience/cleanup pass,
+    not a correctness requirement -- safe to run repeatedly (idempotent: a
+    second run finds nothing left to rename) and safe to skip.
+
+    ``dry_run`` (the default) only prints the plan. Pass ``apply=True`` to
+    write it. If neither the caller's ``config`` nor ``config.json`` has any
+    ``identity.aliases`` configured, this is a no-op.
+    """
+    from .config import MempalaceConfig
+    from .palace import get_collection
+
+    cfg = config if config is not None else MempalaceConfig()
+    alias_map = cfg.identity_aliases
+    if not alias_map:
+        print("  No identity.aliases configured -- nothing to migrate.")
+        return False
+
+    alias_to_canonical = {}
+    for canonical, aliases in alias_map.items():
+        for alias in aliases:
+            if alias != canonical:
+                alias_to_canonical[alias] = canonical
+
+    try:
+        drawers = get_collection(palace_path, create=False)
+    except Exception as exc:
+        print(f"  No drawer collection found at {palace_path} ({exc}).")
+        return False
+
+    items = list(_iter_collection_items(drawers))
+    summary, updates = plan_identity_renames(items, alias_to_canonical)
+
+    if not updates:
+        print("  All diary entries already use their canonical identity -- nothing to migrate.")
+        return False
+
+    print("\n  Identity migration plan (diary drawers only):")
+    for (alias, canonical), count in sorted(summary.items()):
+        print(f"    {alias!r} -> {canonical!r}: {count} entrie(s)")
+
+    if dry_run and not apply:
+        print("\n  DRY RUN -- no changes made. Re-run with --apply to write.\n")
+        return True
+
+    _apply_wing_updates(drawers, updates)
+    print(f"\n  Migrated {len(updates)} diary entrie(s).\n")
+    return True
+
+
 _TRIPLE_ROW_DEFAULTS = {
     "valid_from": None,
     "valid_to": None,

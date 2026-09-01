@@ -836,6 +836,53 @@ class MempalaceConfig:
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property
+    def identity_canonical(self):
+        """This agent's canonical identity name, if configured.
+
+        Read from ``config.json``'s ``identity.canonical`` key, then
+        ``MEMPALACE_IDENTITY_CANONICAL``. ``None`` when unset, meaning
+        callers (e.g. ``_diary_agent_for_harness``) fall back to their own
+        hardcoded per-harness default (RFC 005 / the three-way diary split
+        this config key exists to end).
+        """
+        env_val = os.environ.get("MEMPALACE_IDENTITY_CANONICAL")
+        if env_val:
+            return env_val.strip().lower()
+        value = self._file_config.get("identity", {}).get("canonical")
+        return str(value).strip().lower() if value else None
+
+    @property
+    def identity_aliases(self):
+        """Map of canonical agent identity -> list of alias identities.
+
+        Read from ``config.json``'s ``identity.aliases`` key, e.g.::
+
+            {"identity": {"aliases": {"mac-claude": ["claude", "claude_code"]}}}
+
+        Keys and alias values are normalized to lowercase to match the
+        lowercasing ``tool_diary_write``/``tool_diary_read`` already apply to
+        ``agent_name`` (#1243). Malformed entries are skipped rather than
+        raising, since this is read on every diary lookup.
+        """
+        raw = self._file_config.get("identity", {}).get("aliases", {})
+        if not isinstance(raw, dict):
+            return {}
+        result = {}
+        for canonical, aliases in raw.items():
+            if not isinstance(canonical, str) or not canonical.strip():
+                continue
+            if not isinstance(aliases, list):
+                continue
+            normalized = [str(a).strip().lower() for a in aliases if str(a).strip()]
+            if normalized:
+                result[canonical.strip().lower()] = normalized
+        return result
+
+    def aliases_for_identity(self, canonical: str) -> list:
+        """Return the configured alias list for ``canonical`` (lowercased), or []."""
+        return list(self.identity_aliases.get(str(canonical).strip().lower(), []))
+
+    @property
     def backend(self):
         """Storage backend name.
 

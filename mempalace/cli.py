@@ -1884,6 +1884,15 @@ def cmd_migrate_wings(args):
     )
 
 
+def cmd_identity_migrate(args):
+    """Re-key diary drawers filed under a configured identity alias."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    from .migrate import migrate_identity_aliases
+
+    apply = getattr(args, "apply", False)
+    migrate_identity_aliases(palace_path=palace_path, dry_run=not apply, apply=apply)
+
+
 def _palace_home_dir(args) -> str:
     """The palace home to back up/restore: the parent of ``palace_path``.
 
@@ -3121,7 +3130,16 @@ def cmd_rules(args):
     """Output the shared-brain agent rules block for a given agent identity."""
     from .instructions_cli import run_rules
 
-    run_rules(agent_id=args.agent)
+    agent_id = args.agent
+    if not agent_id:
+        agent_id = MempalaceConfig().identity_canonical
+        if not agent_id:
+            print(
+                "  --agent is required (no identity.canonical configured in config.json)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    run_rules(agent_id=agent_id)
 
 
 def cmd_mcp(args):
@@ -3912,8 +3930,12 @@ def main():
     )
     p_rules.add_argument(
         "--agent",
-        required=True,
-        help="Stable agent identity to render into the rules, e.g. mac-claude",
+        default=None,
+        help=(
+            "Stable agent identity to render into the rules, e.g. mac-claude. "
+            "Defaults to config.json's identity.canonical when omitted; "
+            "required if that is not set."
+        ),
     )
 
     # repair
@@ -4096,6 +4118,20 @@ def main():
         help="Show what would change without modifying the palace",
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
+    # identity-migrate
+    p_identity_migrate = sub.add_parser(
+        "identity-migrate",
+        help=(
+            "Re-key diary drawers filed under a configured identity.aliases "
+            "alias to their canonical agent name (metadata only; idempotent)"
+        ),
+    )
+    p_identity_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the migration (default is dry-run: print the plan only)",
+    )
 
     # backup / restore
     p_backup = sub.add_parser(
@@ -4567,6 +4603,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "identity-migrate": cmd_identity_migrate,
         "backup": cmd_backup,
         "restore": cmd_restore,
         "kg-migrate": cmd_kg_migrate,

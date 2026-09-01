@@ -1389,7 +1389,7 @@ def _ingest_transcript_if_due(transcript_path: str, interval_secs) -> bool:
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
 
 
-def _diary_agent_for_harness(harness: str) -> str:
+def _diary_agent_for_harness(harness: str, config: "MempalaceConfig | None" = None) -> str:
     """Return the diary ``agent_name`` a session in ``harness`` reads under.
 
     Stop-hook checkpoints must be filed beside the agent's own entries so
@@ -1399,7 +1399,27 @@ def _diary_agent_for_harness(harness: str) -> str:
     as ``"claude"``; every other harness already reads under its own name, so
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
+
+    An explicit ``identity.canonical`` in ``config.json`` wins over both of
+    those hardcoded defaults (see docs/rfcs/005-agent-identity-routing.md):
+    an operator who has adopted a shared-brain identity like ``mac-claude``
+    wants checkpoints filed there, not under the bare harness fallback that
+    predates that convention.
     """
+    try:
+        cfg = config if config is not None else MempalaceConfig()
+        canonical = cfg.identity_canonical
+    except Exception:
+        # An unreadable/corrupt config must not break checkpoint filing --
+        # fall through to the hardcoded per-harness default below, same as
+        # every other MempalaceConfig() read in this hook path.
+        canonical = None
+    # ``isinstance`` (not a bare truthiness check) so a test double that mocks
+    # MempalaceConfig wholesale without setting identity_canonical -- leaving
+    # it a MagicMock, which is truthy -- falls through to the hardcoded
+    # default below instead of returning the mock object as an agent name.
+    if isinstance(canonical, str) and canonical:
+        return canonical
     return "claude" if harness == "claude-code" else harness
 
 
