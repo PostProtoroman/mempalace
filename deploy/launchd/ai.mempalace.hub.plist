@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — do not load as-is. Replace before installing:
+    __CHECKOUT__  absolute path to the canonical MemPalace checkout
+                  (the job runs from that checkout's own .venv)
+    __HOME__      the user's home directory (launchd does not expand ~)
+  See deploy/launchd/README.md for the install/uninstall commands.
+
+  The hub holds the palace writer lease for its whole lifetime; everything
+  else (Codex capture included) routes writes through it. Loopback-only by
+  default — pass different serve flags deliberately, not by template edit
+  drift.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.mempalace.hub</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CHECKOUT__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>mempalace</string>
+        <string>serve</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8765</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.mempalace/hub/service.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.mempalace/hub/service.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>

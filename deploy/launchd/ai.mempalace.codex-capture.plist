@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — do not load as-is. Replace before installing:
+    __CHECKOUT__  absolute path to the canonical MemPalace checkout
+                  (the job runs from that checkout's own .venv)
+    __HOME__      the user's home directory (launchd does not expand ~)
+  See deploy/launchd/README.md for the install/uninstall commands.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.mempalace.codex-capture</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CHECKOUT__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>mempalace</string>
+        <string>codex-capture</string>
+        <string>--interval</string>
+        <string>15</string>
+        <!-- The service never touches the user's AGENTS.md. Recall is
+             installed only by an explicit `mempalace codex-recall install`. -->
+        <string>--no-recall</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.mempalace/codex_capture/service.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.mempalace/codex_capture/service.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>
