@@ -53,7 +53,7 @@ import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from datetime import date, datetime  # noqa: E402
+from datetime import date, datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
@@ -386,6 +386,8 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
+        "mempalace_event_cursor_get",
+        "mempalace_event_cursor_set",
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
@@ -422,8 +424,14 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_LOCK_HOLDER = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+# Degraded-mode background lease retry (bounded interval, seconds).
+_LEASE_RETRY_SECS_ENV = "MEMPALACE_MCP_LEASE_RETRY_SECS"
+_LEASE_RETRY_SECS_DEFAULT = 15.0
+_LEASE_RETRY_SECS_MIN = 1.0
+_LEASE_RETRY_SECS_MAX = 300.0
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -445,6 +453,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_event_append",
         "mempalace_task_create",
         "mempalace_event_ack",
+        "mempalace_event_cursor_set",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
     }
@@ -462,6 +471,7 @@ _PEER_WRITER_EXEMPT_TOOLS = frozenset(
         "mempalace_event_append",
         "mempalace_task_create",
         "mempalace_event_ack",
+        "mempalace_event_cursor_set",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
     }
@@ -740,7 +750,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_LOCK_HOLDER, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
@@ -772,6 +782,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         lock_cm.__enter__()
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
+        _MCP_WRITER_LOCK_HOLDER = str(exc)
         _MCP_WRITER_LOCK_ERROR = (
             "another mempalace writer already holds the palace lock for "
             f"{_config.palace_path!r}: {exc}"
@@ -801,7 +812,69 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
+    _MCP_WRITER_LOCK_HOLDER = ""
     return True, ""
+
+
+def _writer_mode() -> dict:
+    """Current writer mode for /statusz and mempalace_status.
+
+    ``degraded`` means: a peer holds the palace writer lease, so palace write
+    tools return a structured retryable error while logstream tools, reads,
+    and /healthz keep working. ``full`` is normal operation (including a
+    stdio server that simply has not needed the lease yet).
+    """
+    payload = {"mode": "degraded" if _MCP_WRITER_READ_ONLY else "full"}
+    if _MCP_WRITER_READ_ONLY and _MCP_WRITER_LOCK_HOLDER:
+        payload["holder"] = _MCP_WRITER_LOCK_HOLDER
+    return payload
+
+
+def _lease_retry_interval_secs() -> float:
+    """Bounded background lease-retry interval (env-tunable, clamped)."""
+    raw = os.environ.get(_LEASE_RETRY_SECS_ENV, "").strip()
+    try:
+        secs = float(raw) if raw else _LEASE_RETRY_SECS_DEFAULT
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0fs",
+            _LEASE_RETRY_SECS_ENV,
+            raw,
+            _LEASE_RETRY_SECS_DEFAULT,
+        )
+        secs = _LEASE_RETRY_SECS_DEFAULT
+    return min(_LEASE_RETRY_SECS_MAX, max(_LEASE_RETRY_SECS_MIN, secs))
+
+
+def _start_writer_lease_retry_thread() -> None:
+    """Retry palace-lease acquisition in the background while degraded.
+
+    A degraded HTTP server must not stay degraded after the lease holder
+    exits: KeepAlive restarting the hub into the same refusal every 30s was
+    exactly the outage this replaces. The retry serializes on the HTTP
+    request lock so it cannot race a mutating tool call's own acquisition
+    attempt (mine_palace_lock is re-entrant per process, so two in-process
+    contenders must not interleave). Promotion is logged; the lease release
+    on shutdown is handled by the atexit hook _acquire_mcp_writer_lock
+    registers.
+    """
+    interval = _lease_retry_interval_secs()
+
+    def _retry() -> None:
+        while True:
+            time.sleep(interval)
+            with _HTTP_REQUEST_LOCK:
+                if _MCP_WRITER_LOCK_CM is not None:
+                    return
+                ok, _reason = _acquire_mcp_writer_lock()
+            if ok:
+                logger.info(
+                    "Palace writer lease acquired; promoting this server from "
+                    "degraded to full mode."
+                )
+                return
+
+    threading.Thread(target=_retry, name="mcp-lease-retry", daemon=True).start()
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
@@ -822,6 +895,8 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
                 "tool": tool_name,
                 "palace": _config.palace_path,
                 "reason": reason,
+                "retryable": True,
+                **_writer_mode(),
                 "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
             },
         },
@@ -5039,6 +5114,32 @@ def tool_event_ack(
     return {"success": True, "event": event}
 
 
+def tool_event_cursor_get(agent: str):
+    """Read an agent's durable logstream cursor (last-processed event id)."""
+    from .logstream_cursors import cursor_get
+
+    try:
+        record = cursor_get(_resolve_logstream_path(), agent)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    if record is None:
+        return {"success": True, "agent": agent, "cursor": None}
+    return {"success": True, "agent": agent, "cursor": record}
+
+
+def tool_event_cursor_set(agent: str, event_id: str):
+    """Atomically persist an agent's last-processed event id."""
+    from .logstream_cursors import cursor_set
+
+    try:
+        record = cursor_set(_resolve_logstream_path(), agent, event_id)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    except OSError as e:
+        return {"success": False, "error": f"could not persist cursor: {e}"}
+    return {"success": True, "cursor": record}
+
+
 def tool_artifact_put(kind: str, content: str, created_by: str, metadata: dict = None):
     """Store exact artifact content (patch, file, log, json, note)."""
     try:
@@ -6111,6 +6212,42 @@ TOOLS = {
         },
         "handler": tool_event_ack,
     },
+    "mempalace_event_cursor_get": {
+        "description": (
+            "Read this agent's durable logstream cursor — the last-processed event id,"
+            " persisted next to the logstream database. Use it at wake-up to resume"
+            " mempalace_event_list with since_event_id instead of hand-carrying ids"
+            " between sessions. Returns cursor: null when the agent has never set one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Agent identity owning the cursor"},
+            },
+            "required": ["agent"],
+        },
+        "handler": tool_event_cursor_get,
+    },
+    "mempalace_event_cursor_set": {
+        "description": (
+            "Persist this agent's last-processed event id as its durable logstream cursor"
+            " (atomic write next to the logstream database). Call it after processing an"
+            " inbox batch so the next session — or `mempalace logstream watch"
+            " --cursor-from-store` — resumes exactly where you stopped."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Agent identity owning the cursor"},
+                "event_id": {
+                    "type": "string",
+                    "description": "Last-processed event id (append-order resume anchor)",
+                },
+            },
+            "required": ["agent", "event_id"],
+        },
+        "handler": tool_event_cursor_set,
+    },
     "mempalace_artifact_put": {
         "description": (
             "Store exact artifact content (unified diff patch, file, log, json, note) for agent"
@@ -6843,6 +6980,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     if tool_name == "mempalace_status" and isinstance(result, dict):
         from .update_awareness import cached_update_status, schedule_update_check
 
+        result.setdefault("writer", _writer_mode())
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
         result.setdefault("updates", {"server": cached_update_status()})
@@ -7255,6 +7393,42 @@ def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warn
     return None
 
 
+_WATCHDOG_JOURNAL_FILENAME = "watchdog.jsonl"
+
+
+def _append_watchdog_journal(tool_name: str, elapsed: float, palace_path: str = None) -> None:
+    """Append a forensic record before the write-stall watchdog exits (75).
+
+    ``os._exit`` leaves no traceback and no core; without this line the only
+    post-restart evidence of a stalled write was the supervisor's exit code.
+    One JSON object per line in ``<palace>/watchdog.jsonl`` — next to the
+    database the stalled write was aimed at. Best-effort by design: a
+    failure to journal must never block the exit that releases the locks.
+    """
+    try:
+        base = palace_path if palace_path is not None else getattr(_config, "palace_path", None)
+        if not base:
+            return
+        line = json.dumps(
+            {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "event": "write_stall_exit",
+                "tool": tool_name,
+                "stall_seconds": round(elapsed, 1),
+                "pid": os.getpid(),
+                "exit_code": _WRITE_STALL_EXIT_CODE,
+            },
+            ensure_ascii=False,
+        )
+        path = os.path.join(os.path.expanduser(base), _WATCHDOG_JOURNAL_FILENAME)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        logger.debug("Failed to append watchdog journal", exc_info=True)
+
+
 @contextlib.contextmanager
 def _write_stall_watch(tool_name: str):
     """Register a vector write as in flight for the stall watchdog."""
@@ -7336,6 +7510,9 @@ def _start_write_stall_watchdog() -> None:
                     _WRITE_STALL_EXIT_ENV,
                     exit_secs,
                 )
+                # Journal first: os._exit leaves no other on-disk trace, and
+                # post-restart forensics need the stuck tool + stall length.
+                _append_watchdog_journal(tool, elapsed)
                 os._exit(_WRITE_STALL_EXIT_CODE)
 
     t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
@@ -7670,6 +7847,7 @@ def _http_status_payload(httpd) -> dict:
         "read_only": _READ_ONLY,
         "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
         "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+        **_writer_mode(),
     }
     if _MCP_WRITER_LOCK_ERROR:
         writer["peer_writer_lock_error"] = _MCP_WRITER_LOCK_ERROR
@@ -8764,17 +8942,32 @@ def _run_http_loop() -> None:
     # still cannot masquerade as an HTTP response.
     logger.info("MemPalace MCP HTTP server starting...")
 
-    # A writable HTTP server is a long-lived storage client, so it must own the
-    # local palace before it binds. Refusing at startup avoids advertising a
-    # writable service that will only fail (or race) on its first mutation.
+    # A writable HTTP server is a long-lived storage client, so it tries to
+    # own the local palace before it binds. But a held lease must DEGRADE
+    # this server, not kill it: refusing to start at all took the logstream
+    # (which needs no palace lease) down with the palace, and a KeepAlive
+    # supervisor just retried into the same refusal every 30s (2026-09-01
+    # outage). Instead: start anyway, serve logstream tools + lease-free
+    # reads + /healthz, return a structured retryable error from palace
+    # write tools, and retry the lease in the background until promotion.
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
     owns_writer_lease = False
     if not _READ_ONLY:
         writer_ok, writer_reason = _acquire_mcp_writer_lock()
-        if not writer_ok:
-            logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
-            raise SystemExit(2)
-        owns_writer_lease = True
+        if writer_ok:
+            owns_writer_lease = True
+        else:
+            logger.warning(
+                "MCP HTTP starting in DEGRADED mode: %s. Logstream tools, "
+                "lease-free reads, and /healthz stay available; palace write "
+                "tools return a retryable error until the lease is won. "
+                "Retrying lease acquisition every %.0fs in the background.",
+                writer_reason,
+                _lease_retry_interval_secs(),
+            )
+            # Promotion later is released by the atexit hook the acquire
+            # path registers, so owns_writer_lease stays False here.
+            _start_writer_lease_retry_thread()
 
     try:
         # The HTTP transport exists for long-lived deployments. Do the cheap

@@ -625,23 +625,38 @@ def test_read_only_off_exposes_mutating_tools(http_server):
     assert "mempalace_add_drawer" in names
 
 
-def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
+def test_writable_http_starts_degraded_without_writer_lease(monkeypatch):
+    """A held palace lease must DEGRADE the HTTP server, not kill it.
+
+    The old refusal (SystemExit 2) took the logstream — which needs no palace
+    lease — down with the palace, and a KeepAlive supervisor retried into the
+    same refusal forever. Now: bind anyway, start the background lease retry,
+    and never own the lease this startup.
+    """
+    events = []
     monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
     monkeypatch.setattr(
         mcp,
         "_acquire_mcp_writer_lock",
         lambda: (False, "another writer owns the palace"),
     )
     monkeypatch.setattr(
-        mcp,
-        "_serve_http",
-        lambda *args: pytest.fail("server must not bind without the writer lease"),
+        mcp, "_start_writer_lease_retry_thread", lambda: events.append("retry-thread")
     )
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(
+        mcp,
+        "_release_mcp_writer_lock",
+        lambda: pytest.fail("degraded startup owns no lease to release"),
+    )
+    monkeypatch.setattr(mcp, "_serve_http", lambda host, port: events.append("serve"))
 
-    with pytest.raises(SystemExit) as exc_info:
-        mcp._run_http_loop()
+    mcp._run_http_loop()
 
-    assert exc_info.value.code == 2
+    assert events == ["retry-thread", "serve"]
 
 
 def test_read_only_http_skips_writer_lease(monkeypatch):

@@ -203,6 +203,22 @@ live-tail, and says so on stderr — replaying a long fleet log would wake a new
 watcher holding weeks of history it cannot tell is stale. `--from-start` opts
 into the replay.
 
+The protocol demands id-cursor resumption, and the cursor now has a home: a
+durable per-agent store next to the logstream database
+(`<palace>/logstream_cursors/<agent>.json`, atomic writes). Record your
+position after an inbox sweep with `mempalace logstream cursor set --agent
+mac-claude --event-id <id>` (or the `mempalace_event_cursor_set` MCP tool),
+read it back with `cursor get`, and let the watch loop arm itself from it:
+
+```bash
+mempalace logstream watch --agent mac-claude --cursor-from-store \
+  --state-file ~/.mempalace/watch/mac-claude.json --json
+```
+
+An explicit `--since-event-id` and an existing `--state-file` checkpoint both
+outrank the store — they describe *this watcher's* position, while the store
+describes the agent's last processed inbox sweep.
+
 `mempalace_event_wait` backs off internally (0.25s → 1s), so a tight retry
 loop around it buys nothing. Filter server-side — `to_agent`, `type`,
 `status` and `correlation_id` are all indexed, and `to_agent=<you>` matches

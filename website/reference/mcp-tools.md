@@ -624,6 +624,31 @@ Acknowledge an event: appends a new `event.ack` routed back to the original writ
 
 ---
 
+### `mempalace_event_cursor_get`
+
+Read an agent's durable resume cursor — the last-processed event id, persisted next to the logstream database (`<palace>/logstream_cursors/<agent>.json`). Use it at wake-up to resume `mempalace_event_list` with `since_event_id` instead of hand-carrying ids between sessions.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent` | string | **Yes** | Agent identity owning the cursor |
+
+**Returns:** `{ success, agent, cursor }` — `cursor` is `null` when the agent has never set one, or `{ agent, event_id, updated_at }`.
+
+---
+
+### `mempalace_event_cursor_set`
+
+Atomically persist an agent's last-processed event id. Call it after processing an inbox batch so the next session — or `mempalace logstream watch --cursor-from-store` — resumes exactly where you stopped.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent` | string | **Yes** | Agent identity owning the cursor |
+| `event_id` | string | **Yes** | Last-processed event id (append-order resume anchor) |
+
+**Returns:** `{ success, cursor: { agent, event_id, updated_at } }`
+
+---
+
 ### `mempalace_artifact_put`
 
 Store exact artifact content for handoffs. UTF-8 text only, max 4 MiB.

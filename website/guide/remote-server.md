@@ -197,6 +197,16 @@ messages between machines.
 - **One writer-lease per process**: a single `mempalace-mcp --transport http`
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
+- **Degraded startup**: when another process (a session's stdio server, a
+  direct CLI mine) already holds the palace writer lease, a writable HTTP
+  server still starts — in *degraded* mode. Logstream tools, reads that need
+  no writer lease, and `/healthz` all work; palace write tools return a
+  structured retryable error naming the lease holder. The server retries the
+  lease in the background (`MEMPALACE_MCP_LEASE_RETRY_SECS`, default 15s,
+  clamped 1–300) and promotes itself to full mode when it wins, logging both
+  transitions. `/statusz` and `mempalace_status` expose
+  `writer.mode: "degraded" | "full"` plus holder info, so a supervisor can
+  tell "waiting for the lease" apart from "down".
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
   works as a load-balancer/Kubernetes liveness probe. For machine-readable
   server state, `GET /statusz` returns JSON with version, uptime, request
