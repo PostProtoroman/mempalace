@@ -102,7 +102,7 @@ The knowledge graph uses SQLite with two tables:
 - `confidence` — 0.0 to 1.0
 - `source_closet` — link back to the verbatim memory
 
-Database location: `~/.mempalace/knowledge_graph.sqlite3`
+Database location: `<palace>/knowledge_graph.sqlite3` (inside the palace directory, e.g. `~/.mempalace/palace/knowledge_graph.sqlite3` by default) — resolved the same way from every launch mode (MCP hub, stdio, CLI). Palaces from before this was unified may have a stray legacy copy at `~/.mempalace/knowledge_graph.sqlite3`; run `mempalace kg-migrate --apply` to merge it in.
 
 ## Related Work
 
