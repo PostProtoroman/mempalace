@@ -4810,6 +4810,7 @@ def main():
         "backup": cmd_backup,
         "restore": cmd_restore,
         "kg-migrate": cmd_kg_migrate,
+        "hermes-install": cmd_hermes_install,
         "hallways": cmd_hallways,
         "dedup": cmd_dedup,
         "status": cmd_status,
