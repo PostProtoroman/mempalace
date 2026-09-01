@@ -24,6 +24,8 @@ Commands:
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
+    mempalace backup                      Snapshot the palace home to a restorable archive
+    mempalace restore <archive> --target DIR   Restore an archive into DIR
 
 Examples:
     mempalace init ~/projects/my_app
@@ -1841,6 +1843,71 @@ def cmd_migrate_wings(args):
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
     )
+
+
+def _palace_home_dir(args) -> str:
+    """The palace home to back up/restore: the parent of ``palace_path``.
+
+    Mirrors ``MempalaceConfig.tunnel_file`` / ``hallway_file``, which already
+    treat ``tunnels.json`` / ``hallways.json`` as living beside ``palace_path``
+    rather than inside it. In the default install this is ``~/.mempalace``,
+    holding ``config.json``, those sibling files, and the ``palace/`` data
+    directory itself (which is where the knowledge graph and diary drawers
+    actually live) — so walking this one directory captures everything
+    ``mempalace backup``'s lane brief lists as critical state, with no
+    special-casing needed for any of them individually.
+
+    Respects ``--palace`` the same way every other maintenance command does,
+    so ``mempalace --palace /custom/palace backup`` backs up ``/custom``.
+    """
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    return os.path.dirname(os.path.normpath(palace_path))
+
+
+def cmd_backup(args):
+    """Snapshot the palace home into a timestamped, restorable archive."""
+    from .backups import DEFAULT_BACKUP_DEST, DEFAULT_BACKUP_KEEP, create_backup
+
+    home_dir = _palace_home_dir(args)
+    dest_dir = os.path.expanduser(args.dest) if args.dest else DEFAULT_BACKUP_DEST
+    keep = args.keep if args.keep is not None else DEFAULT_BACKUP_KEEP
+
+    print(f"\n  Backing up {home_dir}")
+    print(f"  -> {dest_dir} (keeping {keep if keep > 0 else 'all'})")
+    try:
+        result = create_backup(home_dir, dest_dir, keep=keep, log=print)
+    except FileNotFoundError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    print(f"\n  Archive:  {result['archive_path']}")
+    print(f"  Manifest: {result['manifest_path']}")
+    print(f"  Files:    {result['manifest']['file_count']}")
+    if result["skipped"]:
+        print(
+            f"  Skipped {len(result['skipped'])} entrie(s) that cannot be copied (see log above)."
+        )
+
+
+def cmd_restore(args):
+    """Restore a ``mempalace backup`` archive into an empty target directory."""
+    from .backups import restore_backup
+
+    archive_path = os.path.expanduser(args.archive)
+    target_dir = os.path.expanduser(args.target)
+
+    print(f"\n  Restoring {archive_path}")
+    print(f"  -> {target_dir}")
+    try:
+        result = restore_backup(archive_path, target_dir, log=print)
+    except (FileNotFoundError, ValueError, FileExistsError) as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    manifest = result["manifest"]
+    print(f"\n  Restored to {result['target_dir']}")
+    print(f"  Backup was created: {manifest.get('created_at', '?')}")
+    print(f"  Backed up from:     {manifest.get('source_dir', '?')}")
 
 
 def cmd_hallways(args):
@@ -3949,6 +4016,33 @@ def main():
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    # backup / restore
+    p_backup = sub.add_parser(
+        "backup",
+        help="Snapshot the palace home (config, hallways/tunnels, palace/) to a restorable archive",
+    )
+    p_backup.add_argument(
+        "--dest",
+        default=None,
+        help="Directory to write the archive + manifest into "
+        "(default: ~/.mempalace-backups, outside the palace home)",
+    )
+    p_backup.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        help="Archives to retain in --dest, oldest pruned first (default: 7; 0 keeps all)",
+    )
+
+    p_restore = sub.add_parser(
+        "restore",
+        help="Restore a `mempalace backup` archive into an empty target directory",
+    )
+    p_restore.add_argument("archive", help="Path to the mempalace-<timestamp>.tar.gz archive")
+    p_restore.add_argument(
+        "--target", required=True, help="Empty or nonexistent directory to restore into"
+    )
+
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
@@ -4349,6 +4443,8 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "backup": cmd_backup,
+        "restore": cmd_restore,
         "hallways": cmd_hallways,
         "status": cmd_status,
         "update": cmd_update,

@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MemPalace daily backup — launchd user agent template (macOS).
+
+  Runs `mempalace backup` once a day at 04:00 local time, writing a
+  timestamped tar.gz + manifest to ~/.mempalace-backups (outside the palace
+  home) and pruning down to the last 7 archives. See `mempalace backup --help`
+  for --dest / --keep.
+
+  Install (see deploy/launchd/README.md for the full walkthrough):
+    sed -i '' "s#__CHECKOUT__#$(cd /path/to/mempalace/checkout && pwd)#g" \
+      deploy/launchd/ai.mempalace.backup.plist
+    cp deploy/launchd/ai.mempalace.backup.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.mempalace.backup.plist
+
+  __CHECKOUT__ is the absolute path to your mempalace git checkout — the
+  directory containing pyproject.toml and the `.venv` that `uv sync` created
+  (per the project's own CLAUDE.md: `uv sync --extra dev`). Replace every
+  occurrence before installing; a literal "__CHECKOUT__" left in place makes
+  launchd fail to find the binary, silently, until you check the log.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.mempalace.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CHECKOUT__/.venv/bin/mempalace</string>
+        <string>backup</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__CHECKOUT__</string>
+
+    <!-- Daily at 04:00. launchd runs the job at the next matching wall-clock
+         time even if the Mac was asleep at 04:00 sharp (it fires on wake),
+         and simply skips a run the machine was off for entirely — there is
+         no catch-up queue. --keep prunes on every successful run, so a
+         missed day or two is harmless; it just means the next backup is
+         further from the last one than usual. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Not RunAtLoad: a login/reload should not also fire an ad-hoc backup
+         outside the schedule above. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- `mempalace backup` prints its own progress; land it somewhere you can
+         check rather than losing it to /dev/null. Rotate these yourself
+         (e.g. `newsyslog` or a periodic truncate) — launchd does not. -->
+    <key>StandardOutPath</key>
+    <string>__CHECKOUT__/.mempalace-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__CHECKOUT__/.mempalace-backup.log</string>
+
+    <!-- Minimal PATH for the one absolute-path invocation above; a GUI-launched
+         launchd job does not inherit your shell's PATH (see hooks/README.md's
+         MEMPAL_PYTHON note for the same gotcha on the capture-hook side). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
