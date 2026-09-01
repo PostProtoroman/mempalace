@@ -250,6 +250,34 @@ def test_kg_unification_no_legacy_is_ok(monkeypatch, palace_path):
             "target_path": palace_path + "/knowledge_graph.sqlite3",
             "legacy_triples": 0,
             "legacy_entities": 0,
+            "merged_triples": 0,
+            "merged_entities": 0,
+        },
+    )
+    result = doctor.check_kg_unification(palace_path)
+    assert result.status == "ok"
+
+
+def test_kg_unification_already_migrated_is_ok(monkeypatch, palace_path):
+    """Regression test: the legacy KG file still has rows (it is never
+
+    deleted by the migration -- see migrate_knowledge_graph's docstring),
+    but every one of them already exists in the target KG. This is exactly
+    the state `mempalace kg-migrate` dry-run reports as "0 new, N already
+    present". Previously this check warned forever in that state because it
+    compared against the legacy file's total row counts instead of the
+    counts still outstanding.
+    """
+    monkeypatch.setattr(
+        "mempalace.migrate.migrate_knowledge_graph",
+        lambda palace_path, apply=False: {
+            "legacy_path": "/tmp/legacy.sqlite3",
+            "target_path": palace_path + "/knowledge_graph.sqlite3",
+            "legacy_triples": 69,
+            "legacy_entities": 97,
+            "merged_triples": 0,
+            "merged_entities": 0,
+            "skipped_existing": 69,
         },
     )
     result = doctor.check_kg_unification(palace_path)
@@ -264,6 +292,8 @@ def test_kg_unification_legacy_data_warns(monkeypatch, palace_path):
             "target_path": palace_path + "/knowledge_graph.sqlite3",
             "legacy_triples": 5,
             "legacy_entities": 3,
+            "merged_triples": 5,
+            "merged_entities": 3,
         },
     )
     result = doctor.check_kg_unification(palace_path)

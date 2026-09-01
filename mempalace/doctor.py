@@ -466,17 +466,26 @@ def check_kg_unification(palace_path: str) -> CheckResult:
         # text before the JSON payload.
         with contextlib.redirect_stdout(io.StringIO()):
             result = migrate_knowledge_graph(palace_path=palace_path, apply=False)
-        legacy_triples = result.get("legacy_triples", 0)
-        legacy_entities = result.get("legacy_entities", 0)
-        if not legacy_triples and not legacy_entities:
+        # NOTE: `legacy_triples`/`legacy_entities` are the TOTAL row counts in
+        # the legacy sqlite file, not the counts still missing from the
+        # palace KG -- migrate_knowledge_graph() already dedupes by row id
+        # (see its `existing_triple_ids`/`existing_entity_ids` sets) and
+        # reports the outstanding work in `merged_triples`/`merged_entities`.
+        # Using the totals here made this check warn forever any time the
+        # legacy file had *any* rows, even after a full `kg-migrate --apply`
+        # (or, as observed, when `kg-migrate` dry-run already reports
+        # "0 new, N already present"). Compare on the pending counts instead.
+        pending_triples = result.get("merged_triples", 0)
+        pending_entities = result.get("merged_entities", 0)
+        if not pending_triples and not pending_entities:
             return _ok(name, "no legacy knowledge graph to migrate")
         return _warn(
             name,
-            f"legacy KG at {result.get('legacy_path')} has {legacy_triples} triple(s) / "
-            f"{legacy_entities} entitie(s) not yet in the palace KG",
+            f"legacy KG at {result.get('legacy_path')} has {pending_triples} triple(s) / "
+            f"{pending_entities} entitie(s) not yet in the palace KG",
             "run `mempalace kg-migrate --apply` to merge it in",
-            legacy_triples=legacy_triples,
-            legacy_entities=legacy_entities,
+            legacy_triples=pending_triples,
+            legacy_entities=pending_entities,
             legacy_path=result.get("legacy_path"),
             target_path=result.get("target_path"),
         )
