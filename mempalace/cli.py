@@ -1275,6 +1275,47 @@ def mine_source_adapter(
                 knowledge_graph.close()
 
 
+def cmd_hermes_install(args):
+    """Install the Hermes memory-provider plugin file into ``$HERMES_HOME/plugins/``.
+
+    The pip entry point (``hermes_agent.memory_providers``) already makes
+    the provider loadable without any copy; this command is for setups
+    that prefer a directory plugin (which additionally gets Hermes'
+    dashboard config panel and ``hermes <provider>`` CLI hooks).
+
+    Dry-run by default: only PRINTS the plan unless ``--apply`` is given.
+    Never touches any Hermes runtime state beyond copying one file.
+    """
+    import shutil
+
+    from . import integrations
+
+    src = Path(integrations.__file__).resolve().parent / "hermes" / "__init__.py"
+    hermes_home = Path(
+        os.path.expanduser(args.hermes_home or os.environ.get("HERMES_HOME") or "~/.hermes")
+    )
+    dest_dir = hermes_home / "plugins" / "mempalace"
+    dest = dest_dir / "__init__.py"
+
+    print("Hermes provider install plan:")
+    print(f"  source: {src}")
+    print(f"  target: {dest}")
+    print(
+        "  note:   pip installs are already discoverable via the "
+        "'hermes_agent.memory_providers' entry point; this copy is optional."
+    )
+    if not src.exists():
+        print("  ERROR: provider source not found — is mempalace installed correctly?")
+        return 1
+    if not args.apply:
+        print("  (dry run — pass --apply to copy the file)")
+        return 0
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    print("  installed. Set 'memory.provider: mempalace' in your Hermes config.yaml.")
+    return 0
+
+
 def cmd_codex_capture(args):
     """Capture Codex sessions into the palace.
 
@@ -3682,6 +3723,23 @@ def main():
 
     # sweep
     # codex-capture
+    p_hermes = sub.add_parser(
+        "hermes-install",
+        help="Copy the Hermes memory-provider plugin into $HERMES_HOME/plugins/ "
+        "(dry run unless --apply; pip installs need no copy)",
+    )
+    p_hermes.add_argument(
+        "--hermes-home",
+        default=None,
+        help="Hermes home directory (default: $HERMES_HOME or ~/.hermes)",
+    )
+    p_hermes.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually copy the file (default: print the plan only)",
+    )
+    p_hermes.set_defaults(func=cmd_hermes_install)
+
     p_codex = sub.add_parser(
         "codex-capture",
         help="Capture Codex CLI sessions into the palace (never writes AGENTS.md)",

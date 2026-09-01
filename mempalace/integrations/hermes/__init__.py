@@ -45,6 +45,18 @@ Design notes
   not configurable on the Hermes side — a second knob would let the
   write and read sides diverge silently again.
 
+* Loss-proofing: every turn is journalled to an append-only spool file
+  (``<palace parent>/hermes_spool.jsonl``) BEFORE entering the in-memory
+  queue; the worker checkpoints a byte offset per successful write, and
+  ``initialize()`` replays unflushed lines (dedup via a ``turn_uid``
+  stamped in drawer metadata). Persistence failures escalate at ERROR
+  (rate-limited) and surface on ``mempalace_status`` under
+  ``persistence``.
+
+* Diary tools write to the SAME palace diary the mcp_server hub uses
+  (room="diary" drawers with agent="hermes") — a legacy private
+  ``diary.jsonl`` is migrated in on first use and renamed ``.migrated``.
+
 * ``~/.mempalace/identity.txt`` (L0) and ``~/.mempalace/wing_config.json``
   are loaded if present but never created here. Run
   ``mempalace init <project-dir>`` to generate them.
@@ -60,13 +72,14 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import queue
 import re
 import threading
-from collections import deque
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -248,6 +261,21 @@ def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
             if re.search(pattern, text_lower):
                 return wing_name
     return "wing_general"
+
+
+def _turn_uid(session_id: str, authored_at: str, user_text: str, assistant_text: str) -> str:
+    """Stable identity for one live turn, used for spool-replay dedup.
+
+    Stamped into drawer metadata on every live write so a replay of an
+    unflushed spool line can ask the palace "was this exact turn already
+    filed?" instead of re-minting a duplicate drawer (``filed_at`` is part
+    of the drawer-id hash, so the id alone cannot dedup a replay).
+    """
+    h = hashlib.sha256()
+    for part in (session_id, authored_at, user_text, assistant_text):
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:32]
 
 
 def _normalize_content(content: Any) -> str:
@@ -626,6 +654,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     DEFAULT_PALACE_PATH = "~/.mempalace/palace"
     DEFAULT_IDENTITY_PATH = "~/.mempalace/identity.txt"
     WORKER_QUEUE_MAX = 500
+    # Spool journal: every turn is appended here BEFORE it enters the
+    # in-memory queue, and the worker checkpoints a byte offset after each
+    # successful palace write. A crash (or a queue-full drop, or a failed
+    # write) leaves the turn's line beyond the checkpoint, and the next
+    # ``initialize()`` replays it through the same filing path — the crash
+    # loss window is zero-by-replay instead of "whatever was queued".
+    SPOOL_MAX_BYTES = 5 * 1024 * 1024
+    SPOOL_KEEP_ROTATED = 3
+    # Persistence failures log at ERROR, rate-limited to one line per this
+    # many seconds so a wedged disk doesn't turn the log into per-turn spam.
+    PERSIST_ERROR_LOG_INTERVAL = 60.0
     # Cap for status-style metadata scans. On large palaces (200k+ drawers)
     # an unbounded ``col.get(include=["metadatas"])`` would materialize every
     # row into Python memory just to compute counts — multi-second hangs and
@@ -668,6 +707,19 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # initialize() must be serialised against concurrent re-entries so we
         # don't spawn two worker threads sharing one queue.
         self._init_lock = threading.Lock()
+
+        # Spool journal + persistence-health state (see SPOOL_MAX_BYTES).
+        self._spool_lock = threading.Lock()
+        # Checkpoint never advances past this offset — frozen at the start
+        # of the first dropped or failed line so it stays replayable. Replay
+        # is idempotent (turn_uid dedup), so freezing early is always safe.
+        self._spool_ckpt_cap = float("inf")
+        self._persist_consecutive_failures = 0
+        self._persist_total_failures = 0
+        self._persist_last_error = ""
+        self._persist_last_error_log = 0.0
+        self._dropped_turns = 0
+        self._diary_migration_done = False
 
     # ----- Required ABC ------------------------------------------------------
 
@@ -759,6 +811,15 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 with self._collection_lock:
                     self._collection = None
 
+            # Replay any turns a previous run journalled but never flushed
+            # (crash, slow drain at exit, queue-full drop, failed write).
+            # Must run BEFORE the worker starts so replayed and live writes
+            # cannot interleave on the checkpoint.
+            if backend_ready:
+                self._spool_ckpt_cap = float("inf")
+                self._persist_consecutive_failures = 0
+                self._replay_spool()
+
             # Background worker for filing — only when the backend opened.
             # Starting a worker against a None collection invites the
             # on_pre_compress / sync_turn data-loss path where the hint
@@ -822,11 +883,16 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return ""
         try:
             n = max(1, min(int(self._config.get("n_prefetch", 3)), 20))
-            result = search_memories(
-                query,
-                palace_path=self._palace_path,
-                n_results=n,
-            )
+            # Reuse the provider's own long-lived collection (single-client
+            # rule, see _l1_story_from_collection) — search_memories must
+            # not construct a second PersistentClient per prefetch.
+            with self._collection_lock:
+                result = search_memories(
+                    query,
+                    palace_path=self._palace_path,
+                    n_results=n,
+                    collection=self._collection,
+                )
             hits = result.get("results", []) if isinstance(result, dict) else []
             if not hits:
                 return ""
@@ -857,24 +923,35 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         assistant_text = _normalize_content(assistant_content)
         if not user_text and not assistant_text:
             return
+        sid = session_id or self._session_id
+        authored_at = datetime.now(timezone.utc).isoformat()
+        turn_uid = _turn_uid(sid, authored_at, user_text, assistant_text)
+        payload = {
+            "user": user_text,
+            "assistant": assistant_text,
+            "session_id": sid,
+            "authored_at": authored_at,
+            "turn_uid": turn_uid,
+        }
+        # Journal BEFORE queueing: from here on the turn survives a crash,
+        # a queue-full drop, and a failed write — replayed on next init.
+        start, end = self._spool_append(payload)
+        payload["spool_start"] = start
+        payload["spool_end"] = end
         try:
-            self._worker_queue.put_nowait(
-                (
-                    "file_turn",
-                    {
-                        "user": user_text,
-                        "assistant": assistant_text,
-                        "session_id": session_id or self._session_id,
-                    },
-                )
-            )
+            self._worker_queue.put_nowait(("file_turn", payload))
         except queue.Full:
-            # Loud, not silent: the verbatim invariant is what mempalace sells.
-            # If the queue saturates we want operators to see it.
-            logger.warning(
-                "MemPalace worker queue full (maxsize=%d) — turn dropped; "
-                "writes likely stalled on disk or ChromaDB",
-                self.WORKER_QUEUE_MAX,
+            # The turn is already in the spool; freeze the checkpoint before
+            # its line so the next initialize() replays it — never lost.
+            self._dropped_turns += 1
+            if start is not None:
+                with self._spool_lock:
+                    self._spool_ckpt_cap = min(self._spool_ckpt_cap, start)
+                self._spool_append({"dropped": True, "turn_uid": turn_uid})
+            self._persist_failure(
+                "worker queue full (maxsize=%d) — turn spooled as dropped, "
+                "replayable on next initialize" % self.WORKER_QUEUE_MAX,
+                None,
             )
 
     # ----- Optional lifecycle hooks ----------------------------------------
@@ -1256,13 +1333,198 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return str(forced)
         return _match_wing_by_keywords(text, self._wing_config)
 
+    # ----- Internal: spool journal + persistence health -------------------
+
+    def _spool_path(self) -> Path:
+        return Path(self._palace_path).parent / "hermes_spool.jsonl"
+
+    def _spool_ckpt_path(self) -> Path:
+        return Path(self._palace_path).parent / "hermes_spool.offset"
+
+    def _spool_append(self, record: Dict[str, Any]) -> tuple:
+        """Append one JSON line; returns ``(start_offset, end_offset)``.
+
+        A spool-write failure is escalated (ERROR, rate-limited) but never
+        blocks the queue path — a broken journal must not also break live
+        filing. Returns ``(None, None)`` on failure.
+        """
+        try:
+            line = json.dumps(record, ensure_ascii=False) + "\n"
+            with self._spool_lock:
+                path = self._spool_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    start = f.tell()
+                    f.write(line)
+                    f.flush()
+                    end = f.tell()
+            return start, end
+        except Exception as exc:
+            self._persist_failure("spool append failed", exc)
+            return None, None
+
+    def _spool_read_checkpoint(self) -> int:
+        try:
+            return int(self._spool_ckpt_path().read_text().strip() or "0")
+        except Exception:
+            return 0
+
+    def _spool_write_checkpoint(self, offset: int) -> None:
+        try:
+            self._spool_ckpt_path().write_text(str(int(offset)))
+        except Exception as exc:
+            self._persist_failure("spool checkpoint write failed", exc)
+
+    def _spool_advance(self, end_offset: Optional[int]) -> None:
+        """Advance the done-marker after a successful write, capped by the
+        freeze point of any earlier dropped/failed line (see __init__)."""
+        if end_offset is None:
+            return
+        with self._spool_lock:
+            target = min(float(end_offset), self._spool_ckpt_cap)
+            if target > self._spool_read_checkpoint():
+                self._spool_write_checkpoint(int(target))
+
+    def _spool_freeze_before(self, start_offset: Optional[int]) -> None:
+        if start_offset is None:
+            return
+        with self._spool_lock:
+            self._spool_ckpt_cap = min(self._spool_ckpt_cap, start_offset)
+
+    def _persist_failure(self, context: str, exc: Optional[Exception]) -> None:
+        """Escalate a persistence failure: ERROR-level (rate-limited) and
+        counted on the provider's health surface (``mempalace_status``)."""
+        self._persist_consecutive_failures += 1
+        self._persist_total_failures += 1
+        self._persist_last_error = f"{context}: {exc}" if exc is not None else context
+        now = time.monotonic()
+        if now - self._persist_last_error_log >= self.PERSIST_ERROR_LOG_INTERVAL:
+            self._persist_last_error_log = now
+            logger.error(
+                "MemPalace persistence failing (consecutive=%d, total=%d): %s",
+                self._persist_consecutive_failures,
+                self._persist_total_failures,
+                self._persist_last_error,
+            )
+
+    def _persist_success(self) -> None:
+        self._persist_consecutive_failures = 0
+
+    def _persistence_health(self) -> Dict[str, Any]:
+        try:
+            spool_size = self._spool_path().stat().st_size
+        except OSError:
+            spool_size = 0
+        return {
+            "consecutive_failures": self._persist_consecutive_failures,
+            "total_failures": self._persist_total_failures,
+            "dropped_turns": self._dropped_turns,
+            "last_error": self._persist_last_error,
+            "spool_unflushed_bytes": max(0, spool_size - self._spool_read_checkpoint()),
+        }
+
+    def _turn_already_filed(self, turn_uid: str) -> bool:
+        """Dedup gate for spool replay — has this turn's drawer landed?"""
+        if not turn_uid:
+            return False
+        try:
+            with self._collection_lock:
+                col = self._collection
+                if col is None:
+                    return False
+                got = col.get(where={"turn_uid": turn_uid}, limit=1, include=["metadatas"])
+            return bool(got.get("ids"))
+        except Exception:
+            return False
+
+    def _replay_spool(self) -> None:
+        """Replay unflushed spool lines from a previous run.
+
+        Runs inside ``initialize()`` after the backend opens and before the
+        worker starts. Each line goes through the SAME dedup/write path as
+        live filing (``_turn_already_filed`` + ``_file_turn``); the
+        checkpoint advances per replayed line, and a failed replay stops so
+        the remaining lines stay for the next attempt. Afterwards a fully
+        flushed spool above ``SPOOL_MAX_BYTES`` is rotated (keeping the
+        last ``SPOOL_KEEP_ROTATED`` rotated files).
+        """
+        path = self._spool_path()
+        if not path.exists():
+            return
+        ckpt = self._spool_read_checkpoint()
+        try:
+            with open(path, encoding="utf-8") as f:
+                f.seek(ckpt)
+                while True:
+                    start = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        # Torn tail from a crash mid-append — unreadable and
+                        # unrecoverable; skip past it so it can't wedge
+                        # replay forever.
+                        logger.warning("MemPalace spool: skipping torn tail line")
+                        self._spool_write_checkpoint(f.tell())
+                        break
+                    end = f.tell()
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        self._spool_write_checkpoint(end)
+                        continue
+                    if not isinstance(record, dict) or record.get("dropped"):
+                        self._spool_write_checkpoint(end)
+                        continue
+                    uid = str(record.get("turn_uid") or "")
+                    if not self._turn_already_filed(uid):
+                        replay = dict(record)
+                        replay["spool_start"] = start
+                        replay["spool_end"] = end
+                        if not self._file_turn(replay):
+                            logger.error(
+                                "MemPalace spool replay stopped at offset %d — "
+                                "will retry on next initialize",
+                                start,
+                            )
+                            return
+                        logger.info("MemPalace: replayed unflushed turn %s from spool", uid)
+                    self._spool_write_checkpoint(end)
+        except OSError as exc:
+            self._persist_failure("spool replay failed", exc)
+            return
+        self._rotate_spool_if_flushed()
+
+    def _rotate_spool_if_flushed(self) -> None:
+        path = self._spool_path()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size <= self.SPOOL_MAX_BYTES or self._spool_read_checkpoint() < size:
+            return
+        with self._spool_lock:
+            try:
+                for i in range(self.SPOOL_KEEP_ROTATED - 1, 0, -1):
+                    older = Path(f"{path}.{i}")
+                    if older.exists():
+                        os.replace(older, f"{path}.{i + 1}")
+                os.replace(path, f"{path}.1")
+                self._spool_write_checkpoint(0)
+                self._spool_ckpt_cap = float("inf")
+            except OSError as exc:
+                self._persist_failure("spool rotation failed", exc)
+
     # ----- Internal: filing + background worker --------------------------
 
-    def _file_turn(self, payload: Dict[str, Any]) -> None:
+    def _file_turn(self, payload: Dict[str, Any]) -> bool:
+        """File one turn. Returns True when the drawer landed (or there was
+        nothing to file), False on a persistence failure — the caller keeps
+        the turn's spool line unflushed so it is replayed, never lost."""
         user_msg = payload.get("user", "") or ""
         assistant_msg = payload.get("assistant", "") or ""
         if not user_msg and not assistant_msg:
-            return
+            return True
         # Classify outside the lock — pure CPU / config, no Chroma access.
         text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
         wing = self._classify_wing(text)
@@ -1270,13 +1532,16 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         extra: Dict[str, Any] = {"source": "hermes"}
         if session_id:
             extra["session_id"] = session_id
+        if payload.get("turn_uid"):
+            extra["turn_uid"] = payload["turn_uid"]
         # Hold the collection lock across the whole upsert so wake-up L1
         # scans (same client) never interleave with writes mid-compactor.
         try:
             with self._collection_lock:
                 col = self._collection
                 if col is None:
-                    return
+                    self._persist_failure("_file_turn: no collection", None)
+                    return False
                 # Always file under a stable room name ("conversations"). Using
                 # session_id here would mint one room per session — pollutes
                 # ``mempalace_list_rooms`` and splits live writes from backfill
@@ -1289,10 +1554,18 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                     text=text,
                     source_file=f"hermes-session:{session_id or 'unknown'}",
                     agent="hermes",
+                    authored_at=payload.get("authored_at"),
                     extra_metadata=extra,
                 )
+            self._persist_success()
+            return True
         except Exception as exc:
-            logger.debug("MemPalace _file_turn error: %s", exc)
+            # Loud, not silent: a swallowed write failure means capture has
+            # stopped while the provider still looks healthy — the exact
+            # failure mode the mission ("verbatim always, 100% recall")
+            # cannot tolerate.
+            self._persist_failure("_file_turn write failed", exc)
+            return False
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
         # target "user" carries facts about the user; target "memory" carries
@@ -1312,7 +1585,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 obj=payload.get("content", ""),
             )
         except Exception as exc:
-            logger.debug("MemPalace _mirror_mem_write error: %s", exc)
+            self._persist_failure("_mirror_mem_write failed", exc)
         finally:
             if kg is not None:
                 try:
@@ -1333,11 +1606,18 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 continue
             try:
                 if task == "file_turn":
-                    self._file_turn(payload)
+                    if self._file_turn(payload):
+                        # Mark the line done via the offset checkpoint —
+                        # the spool itself is append-only, never rewritten.
+                        self._spool_advance(payload.get("spool_end"))
+                    else:
+                        # Keep the failed line (and everything after it)
+                        # replayable on the next initialize().
+                        self._spool_freeze_before(payload.get("spool_start"))
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
-                logger.debug("MemPalace worker task %s error: %s", task, exc)
+                self._persist_failure(f"worker task {task} error", exc)
             finally:
                 try:
                     self._worker_queue.task_done()
@@ -1356,13 +1636,16 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if not query:
             return {"error": "Missing required parameter: query"}
         n = max(1, min(int(n_results or 5), 50))
-        data = search_memories(
-            query,
-            palace_path=self._palace_path,
-            wing=wing or "",
-            room=room or "",
-            n_results=n,
-        )
+        # Single-client rule: search on the provider's own open collection.
+        with self._collection_lock:
+            data = search_memories(
+                query,
+                palace_path=self._palace_path,
+                wing=wing or "",
+                room=room or "",
+                n_results=n,
+                collection=self._collection,
+            )
         if isinstance(data, dict) and "error" in data:
             return data
         hits = data.get("results", []) if isinstance(data, dict) else []
@@ -1411,6 +1694,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             "total_drawers": total,
             "wings": wings,
             "palace_path": self._palace_path,
+            # Persistence health — surfaces silent-capture-death to the
+            # model/user: non-zero consecutive_failures or unflushed spool
+            # bytes mean live turns are NOT landing in the palace.
+            "persistence": self._persistence_health(),
         }
         if truncated:
             # ``total_drawers`` already gives the model the 100% reference;
@@ -1556,36 +1843,134 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             except Exception:
                 pass
 
+    # Diary entries land in the SAME palace diary the mcp_server hub uses
+    # (``tool_diary_write``'s storage shape: drawers in the palace collection
+    # under room="diary" / hall="hall_diary" with an ``agent`` field), so a
+    # Hermes diary write is readable by every other agent's diary_read and
+    # vice versa — no forked ~/.mempalace/diary.jsonl continuity. Writes go
+    # through the provider's own collection (single-client rule).
+    DIARY_AGENT = "hermes"
+
+    def _diary_drawer(
+        self,
+        entry: str,
+        filed_at: datetime,
+        topic: str = "general",
+    ) -> tuple:
+        wing = f"wing_{self.DIARY_AGENT}"
+        entry_id = (
+            f"diary_{wing}_{filed_at.strftime('%Y%m%d_%H%M%S%f')}_"
+            f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
+        )
+        metadata = {
+            "wing": wing,
+            "room": "diary",
+            "hall": "hall_diary",
+            "topic": topic,
+            "type": "diary_entry",
+            "agent": self.DIARY_AGENT,
+            "filed_at": filed_at.isoformat(),
+            "date": filed_at.strftime("%Y-%m-%d"),
+            "chunk_index": 0,
+        }
+        return entry_id, metadata
+
+    def _migrate_legacy_diary(self) -> None:
+        """Replay a legacy private ``diary.jsonl`` into the palace diary, once.
+
+        Idempotent: entry ids derive from the legacy timestamp + content
+        hash, and the write is an upsert — re-running (e.g. after a crash
+        mid-migration, before the rename landed) mints the same ids. The
+        file is renamed to ``diary.jsonl.migrated`` afterwards, never
+        deleted — verbatim data is kept.
+        """
+        if self._diary_migration_done:
+            return
+        self._diary_migration_done = True
+        legacy = Path(self._palace_path).parent / "diary.jsonl"
+        if not legacy.exists():
+            return
+        migrated = 0
+        try:
+            with self._collection_lock:
+                col = self._collection
+                if col is None:
+                    self._diary_migration_done = False
+                    return
+                with open(legacy, encoding="utf-8") as f:
+                    for raw_line in f:
+                        try:
+                            record = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
+                        entry = str(record.get("entry") or "")
+                        if not entry:
+                            continue
+                        ts = str(record.get("ts") or "")
+                        try:
+                            filed_at = datetime.fromisoformat(ts)
+                        except ValueError:
+                            filed_at = datetime.now()
+                        entry_id, metadata = self._diary_drawer(entry, filed_at)
+                        col.upsert(ids=[entry_id], documents=[entry], metadatas=[metadata])
+                        migrated += 1
+            os.replace(legacy, f"{legacy}.migrated")
+            logger.info(
+                "MemPalace: migrated %d legacy diary entries into the palace diary", migrated
+            )
+        except Exception as exc:
+            self._diary_migration_done = False
+            self._persist_failure("legacy diary migration failed", exc)
+
     def _tool_diary_write(self, entry: str) -> Dict[str, Any]:
         if not entry:
             return {"error": "Missing required parameter: entry"}
-        diary_path = Path(self._palace_path).parent / "diary.jsonl"
-        diary_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {"ts": datetime.now(timezone.utc).isoformat(), "entry": entry}
-        with open(diary_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        return {"status": "ok"}
+        self._migrate_legacy_diary()
+        entry_id, metadata = self._diary_drawer(entry, datetime.now())
+        try:
+            with self._collection_lock:
+                col = self._collection
+                if col is None:
+                    return {"error": "MemPalace not initialized"}
+                col.upsert(ids=[entry_id], documents=[entry], metadatas=[metadata])
+        except Exception as exc:
+            self._persist_failure("diary write failed", exc)
+            return {"error": f"diary write failed: {exc}"}
+        return {"status": "ok", "entry_id": entry_id, "timestamp": metadata["filed_at"]}
 
     def _tool_diary_read(self, n: int = 10) -> Dict[str, Any]:
         if n <= 0:
             return {"entries": []}
-        diary_path = Path(self._palace_path).parent / "diary.jsonl"
-        if not diary_path.exists():
-            return {"entries": []}
-        # Stream the file and keep only the trailing ``n`` lines. Avoids
-        # loading multi-megabyte diaries into memory just to discard the
-        # head.
-        with open(diary_path, encoding="utf-8") as f:
-            tail = deque(f, maxlen=n)
-        recent: List[Dict[str, Any]] = []
-        for raw_line in tail:
+        self._migrate_legacy_diary()
+        with self._collection_lock:
+            col = self._collection
+            if col is None:
+                return {"error": "MemPalace not initialized"}
             try:
-                recent.append(json.loads(raw_line))
-            except json.JSONDecodeError:
-                logger.debug("MemPalace: skipping malformed diary line")
-        return {"entries": recent}
+                results = col.get(
+                    where={"$and": [{"room": "diary"}, {"agent": self.DIARY_AGENT}]},
+                    include=["documents", "metadatas"],
+                    limit=10000,
+                )
+            except Exception as exc:
+                logger.warning("MemPalace diary read failed: %s", exc)
+                return {"error": "Failed to read diary entries"}
+        entries: List[Dict[str, Any]] = []
+        for doc, meta in zip(results.get("documents") or [], results.get("metadatas") or []):
+            meta = meta or {}
+            entries.append(
+                {
+                    # ``entry`` mirrors this tool's historical key; ``content``
+                    # mirrors mcp_server.tool_diary_read.
+                    "entry": doc,
+                    "content": doc,
+                    "timestamp": meta.get("filed_at", ""),
+                    "date": meta.get("date", ""),
+                    "topic": meta.get("topic", ""),
+                }
+            )
+        entries.sort(key=lambda e: e["timestamp"])
+        return {"entries": entries[-n:]}
 
 
 # ---------------------------------------------------------------------------
