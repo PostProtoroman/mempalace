@@ -143,6 +143,21 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
+### `mempalace_codex_capture`
+
+Capture Codex CLI session turns into the palace from inside the hub. Exists so the Codex capture follower never competes for the palace writer lease: a hub holds that lease for its whole lifetime, so a follower writing directly would be refused on exactly the machines a hub runs on, and capture would stop silently. Handing the work to the lease holder keeps a single writer.
+
+Bounded by `max_turns` so a first-time scan of a large corpus cannot park the hub's write path; repeat the call while the response has `pending: true`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessions_root` | string | No | Codex sessions directory (default: `~/.codex/sessions`) |
+| `max_turns` | integer | No | Max turns to write in this call (default 500) |
+
+**Returns:** `{ success, files_scanned, threads_seen, drawers_added, drawers_already_present, turns_skipped_by_cursor, pending }` on success, or `{ success: false, error }` on failure. Drawer ids are deterministic, so repeated calls add nothing and are counted as `drawers_already_present`.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).

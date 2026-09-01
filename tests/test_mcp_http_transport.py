@@ -31,9 +31,9 @@ import pytest
 from mempalace import mcp_server as mcp
 
 
-def _post(port, path, body, headers=None, host_header=None):
+def _post(port, path, body, headers=None, host_header=None, timeout=5):
     """Raw POST with full control over Host / Origin / Authorization headers."""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         raw = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
         headers = headers or {}
@@ -251,6 +251,102 @@ def test_healthz_ok(http_server):
     status, body = _get(port, "/healthz")
     assert status == 200
     assert body == b"ok\n"
+
+
+class _HeldWriteLock:
+    """Hold _HTTP_REQUEST_LOCK the way a long mempalace_mine does.
+
+    A real mine was measured holding it for 61-73s; chromadb writes have no
+    timeout, so the duration is unbounded. The tests below only need the lock
+    genuinely held, not the wall-clock, so nothing here sleeps for minutes.
+    """
+
+    def __enter__(self):
+        self._release = threading.Event()
+        held = threading.Event()
+
+        def _hold():
+            with mcp._HTTP_REQUEST_LOCK:
+                held.set()
+                self._release.wait(timeout=30)
+
+        self._thread = threading.Thread(target=_hold, name="test-write-lock", daemon=True)
+        self._thread.start()
+        assert held.wait(timeout=5), "lock holder thread never acquired the lock"
+        return self
+
+    def __exit__(self, *exc):
+        self._release.set()
+        self._thread.join(timeout=5)
+        assert not self._thread.is_alive(), "lock holder thread did not exit"
+        return False
+
+
+def test_handshake_stays_responsive_while_a_long_write_holds_the_lock(http_server):
+    """Regression: a slow mine must not stall new MCP connections.
+
+    ``mempalace_mine`` runs synchronously and owns ``_HTTP_REQUEST_LOCK`` for
+    its whole write. ``initialize``, ``notifications/initialized``,
+    ``tools/list`` and ``ping`` are answered from module state alone — the
+    protocol constants, the ``TOOLS`` dict and the ``_READ_ONLY`` flag — so
+    they must not queue behind that lock. When they did, any client whose
+    handshake landed inside a mine window hit its own startup deadline and
+    reported a connect timeout, even though the hub was healthy and still
+    serving ``/healthz`` throughout.
+    """
+    port, _ = http_server
+
+    with _HeldWriteLock():
+        started = time.monotonic()
+
+        for request in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+        ):
+            status, body = _post(port, "/mcp", request, timeout=5)
+            assert status == 200, f"{request['method']} returned {status}"
+            assert json.loads(body)["id"] == request["id"]
+
+        # notifications/initialized is part of the handshake and carries no id.
+        status, _ = _post(
+            port, "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=5
+        )
+        assert status == 202
+
+        assert _get(port, "/healthz")[0] == 200
+
+        elapsed = time.monotonic() - started
+        # Generous next to a 30s client budget, tight next to a 60s+ mine.
+        assert elapsed < 5, f"handshake took {elapsed:.1f}s while the write lock was held"
+
+
+def test_palace_touching_call_still_serializes_on_the_write_lock(http_server):
+    """The lock-free set must not become a hole in write serialization.
+
+    Guards the other direction of the fix above: a tools/call that reaches the
+    palace still waits for the in-flight write instead of running beside it.
+    """
+    port, _ = http_server
+
+    with _HeldWriteLock():
+        with pytest.raises((TimeoutError, OSError)):
+            _post(
+                port,
+                "/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "mempalace_search", "arguments": {"query": "x"}},
+                },
+                timeout=1,
+            )
+
+    # With the write finished, the same call is served again.
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
+    assert status == 200
+    assert json.loads(body)["id"] == 5
 
 
 def test_statusz_reports_machine_readable_server_and_client_state(http_server, monkeypatch):

@@ -1246,6 +1246,201 @@ def mine_source_adapter(
                 knowledge_graph.close()
 
 
+def cmd_codex_capture(args):
+    """Capture Codex sessions into the palace.
+
+    Never touches ``~/.codex/AGENTS.md``. Recall is installed only by an
+    explicit ``mempalace codex-recall install`` — turning capture on and
+    changing the user's instructions file are separate decisions.
+    """
+    from .codex_follower import (
+        DEFAULT_SESSIONS_ROOT,
+        ensure_activation,
+        follow,
+        plan_backfill,
+        run_once,
+    )
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+    backfill = bool(getattr(args, "backfill", False))
+
+    print(f"  Palace:         {palace_path}")
+    print(f"  Codex sessions: {os.path.expanduser(sessions_root)}")
+
+    if getattr(args, "dry_run", False):
+        if not backfill:
+            print(
+                "mempalace: --dry-run only applies to --backfill "
+                "(normal capture writes new turns as they appear)",
+                file=sys.stderr,
+            )
+            return 1
+        plan = plan_backfill(palace_path, sessions_root)
+        print("\n  Backfill plan (nothing written):")
+        print(f"    Rollout files scanned:      {plan['files_scanned']}")
+        print(f"    Conversation turns found:   {plan['turns_found']}")
+        print(f"    Estimated NEW drawers:      {plan['estimated_new_drawers']}")
+        print(f"    Already in the palace:      {plan['already_present']}")
+        print(f"    Automation files excluded:  {plan['automation_files_excluded']}")
+        print(
+            f"    Subagent turns included:    {plan['subagent_turns_included']} "
+            f"(from {plan['subagent_files_included']} file(s), lineage preserved)"
+        )
+        print(f"    Threads:                    {plan['threads_seen']}")
+        if plan["destinations"]:
+            print("    Destination wings/rooms:")
+            for dest, count in list(plan["destinations"].items())[:15]:
+                print(f"      {dest}: {count}")
+        print("\n  Run again without --dry-run to import.")
+        return 0
+
+    # Recording the activation point before the first pass is what makes
+    # "capture new turns" the default: everything already in the rollouts is
+    # baselined and left alone unless --backfill is given.
+    if backfill:
+        print("  Mode:           BACKFILL (importing existing history)")
+    else:
+        activation = ensure_activation(palace_path, sessions_root)
+        print(
+            f"  Mode:           new turns only "
+            f"(activated {activation.get('activated_at', '?')[:19]}, "
+            f"{activation.get('rollouts_at_activation', 0)} existing rollout(s) baselined)"
+        )
+
+    if args.once:
+        stats = run_once(palace_path, sessions_root, backfill=backfill)
+        if stats.get("error"):
+            print(f"  Capture failed via {stats.get('writer')}: {stats['error']}", file=sys.stderr)
+            return 1
+        print(
+            f"  Wrote via {stats.get('writer')}: +{stats['drawers_added']} new, "
+            f"{stats['drawers_already_present']} already present."
+        )
+        return 0
+
+    print(f"  Following every {args.interval:.0f}s. Ctrl-C to stop.")
+    totals = follow(palace_path, sessions_root, interval=args.interval)
+    print(f"  Stopped after {totals['passes']} pass(es): +{totals['drawers_added']} new drawers.")
+    return 0
+
+
+def cmd_codex_recall(args):
+    """Install or remove the MemPalace recall block in Codex's instructions."""
+    from . import codex_recall
+
+    action = getattr(args, "recall_action", None)
+    if action == "status":
+        installed = codex_recall.is_installed(args.agents_file)
+        print(f"  Recall block: {'installed' if installed else 'not installed'}")
+        print(f"  File:         {os.path.expanduser(args.agents_file)}")
+        return 0
+    if action == "install":
+        result = codex_recall.install(args.agents_file)
+        verb = "Refreshed" if result["replaced"] else "Installed"
+        print(f"  {verb} the MemPalace recall block in {result['path']}")
+        print("  Your own content in that file was preserved.")
+        return 0
+    print("mempalace: specify install | status", file=sys.stderr)
+    return 1
+
+
+def cmd_codex_status(args):
+    """Show whether Codex capture is ACTIVE, DEGRADED, or BLOCKED."""
+    from . import codex_recall, codex_service
+    from .codex_follower import DEFAULT_SESSIONS_ROOT, status
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+    home = getattr(args, "home", None)
+    st = status(palace_path, sessions_root)
+
+    print(f"  Codex capture:  {st['state']}")
+    print(f"  Writer:         {st['writer']}")
+    if st["hub_url"]:
+        reach = "reachable" if st["hub_reachable"] else "UNREACHABLE"
+        print(f"  Hub:            {st['hub_url']} ({reach})")
+    else:
+        print("  Hub:            none registered (direct writes)")
+    if st["follower_pid"]:
+        alive = "running" if st["follower_running"] else "not running"
+        print(f"  Follower:       pid {st['follower_pid']} ({alive})")
+    else:
+        print("  Follower:       never started")
+    if st["heartbeat_at"]:
+        print(f"  Last pass:      {st['heartbeat_at']}")
+    print(f"  Sessions root:  {os.path.expanduser(st['sessions_root'])}")
+    print(f"  Rollouts seen:  {st['rollouts_on_disk']}")
+    print(f"  Codex drawers:  {st['codex_drawers']} across {st['codex_threads']} thread(s)")
+    if st["latest_turn_at"]:
+        print(f"  Latest turn:    {st['latest_turn_at']}")
+    if st["capture_lag_seconds"] is not None:
+        print(f"  Capture lag:    {st['capture_lag_seconds']:.0f}s")
+    if st["last_error"]:
+        print(f"  Last error:     {st['last_error']}")
+    print(
+        f"  Service:        {'installed' if codex_service.is_installed(home) else 'not installed'}"
+    )
+    installed = codex_recall.is_installed(args.agents_file)
+    print(f"  Recall block:   {'installed' if installed else 'MISSING'}")
+    return 0 if st["state"] != "BLOCKED" else 1
+
+
+def cmd_codex_service(args):
+    """install / start / stop / status / uninstall the capture service."""
+    from . import codex_service
+    from .codex_follower import DEFAULT_SESSIONS_ROOT
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    sessions_root = args.sessions_root or DEFAULT_SESSIONS_ROOT
+    home = getattr(args, "home", None)
+    action = getattr(args, "service_action", None)
+
+    try:
+        if action == "install":
+            result = codex_service.install(
+                palace_path,
+                sessions_root,
+                interval=args.interval,
+                home=home,
+                load=not args.no_load,
+            )
+            print(f"  Installed {result['label']}")
+            print(f"  Plist:  {result['plist']}")
+            print(
+                f"  Loaded: {'yes' if result['loaded'] else 'no (run: mempalace codex-service start)'}"
+            )
+            return 0
+        if action == "start":
+            print(
+                "  Started" if codex_service.start(home) else "  Could not start (is it installed?)"
+            )
+            return 0
+        if action == "stop":
+            print("  Stopped" if codex_service.stop(home) else "  Not running")
+            return 0
+        if action == "status":
+            print(f"  Installed: {'yes' if codex_service.is_installed(home) else 'no'}")
+            print(f"  Loaded:    {'yes' if codex_service.is_loaded(home) else 'no'}")
+            print(f"  Plist:     {codex_service.plist_path(home)}")
+            return 0
+        if action == "uninstall":
+            result = codex_service.uninstall(palace_path, home=home)
+            if result["removed"]:
+                for path in result["removed"]:
+                    print(f"  Removed {path}")
+            else:
+                print("  Nothing to remove")
+            print("  Palace data and AGENTS.md left untouched.")
+            return 0
+    except codex_service.ServiceError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        return 1
+
+    print("mempalace: specify install | start | stop | status | uninstall", file=sys.stderr)
+    return 1
+
+
 def cmd_sweep(args):
     """Sweep a transcript file or directory.
 
@@ -3333,6 +3528,75 @@ def main():
     )
 
     # sweep
+    # codex-capture
+    p_codex = sub.add_parser(
+        "codex-capture",
+        help="Capture Codex CLI sessions into the palace (never writes AGENTS.md)",
+    )
+    p_codex.add_argument("--palace", default=None, help="Palace path")
+    p_codex.add_argument("--sessions-root", default=None, help="Codex sessions dir")
+    p_codex.add_argument("--interval", type=float, default=15.0, help="Seconds between scans")
+    p_codex.add_argument("--once", action="store_true", help="Single pass, then exit")
+    p_codex.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Import turns that predate activation (default: only new turns)",
+    )
+    p_codex.add_argument(
+        "--dry-run", action="store_true", help="With --backfill: report the plan, write nothing"
+    )
+    p_codex.add_argument(
+        "--no-recall",
+        action="store_true",
+        help="Accepted for compatibility; capture never writes AGENTS.md",
+    )
+    p_codex.add_argument(
+        "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+    )
+    p_codex.set_defaults(func=cmd_codex_capture)
+
+    p_codex_recall = sub.add_parser(
+        "codex-recall", help="Install the MemPalace recall block into Codex's AGENTS.md"
+    )
+    recall_sub = p_codex_recall.add_subparsers(dest="recall_action")
+    for _rname, _rhelp in (
+        ("install", "Write the recall block (preserves your own content)"),
+        ("status", "Show whether the recall block is installed"),
+    ):
+        _rp = recall_sub.add_parser(_rname, help=_rhelp)
+        _rp.add_argument(
+            "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+        )
+    p_codex_recall.set_defaults(func=cmd_codex_recall)
+
+    p_codex_status = sub.add_parser("codex-status", help="Show whether Codex capture is active")
+    p_codex_status.add_argument("--palace", default=None, help="Palace path")
+    p_codex_status.add_argument("--sessions-root", default=None, help="Codex sessions dir")
+    p_codex_status.add_argument(
+        "--agents-file", default="~/.codex/AGENTS.md", help="Codex instructions file"
+    )
+    p_codex_status.add_argument("--home", default=None, help="Override HOME (testing)")
+    p_codex_status.set_defaults(func=cmd_codex_status)
+
+    p_codex_svc = sub.add_parser(
+        "codex-service", help="Run Codex capture as a background login service"
+    )
+    svc_sub = p_codex_svc.add_subparsers(dest="service_action")
+    for _name, _help in (
+        ("install", "Install and load the service"),
+        ("start", "Start the installed service"),
+        ("stop", "Stop the service"),
+        ("status", "Show service install/load state"),
+        ("uninstall", "Remove MemPalace-managed service files only"),
+    ):
+        _p = svc_sub.add_parser(_name, help=_help)
+        _p.add_argument("--palace", default=None, help="Palace path")
+        _p.add_argument("--sessions-root", default=None, help="Codex sessions dir")
+        _p.add_argument("--interval", type=float, default=15.0, help="Seconds between scans")
+        _p.add_argument("--home", default=None, help="Override HOME (testing)")
+        _p.add_argument("--no-load", action="store_true", help="Write the plist without loading it")
+    p_codex_svc.set_defaults(func=cmd_codex_service)
+
     p_sweep = sub.add_parser(
         "sweep",
         help="Tandem miner: catch anything the primary miner missed "
@@ -4061,6 +4325,10 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,
+        "codex-capture": cmd_codex_capture,
+        "codex-status": cmd_codex_status,
+        "codex-service": cmd_codex_service,
+        "codex-recall": cmd_codex_recall,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "serve": cmd_serve,

@@ -34,6 +34,7 @@ from .base import (
     SourceSummary,
     TransformationViolationError,
 )
+from .codex import CodexSessionAdapter
 from .context import PalaceContext, ProgressHook
 from .registry import (
     available_adapters,
@@ -45,8 +46,14 @@ from .registry import (
     unregister,
 )
 
+# First-party adapters are registered eagerly: `mempalace codex-capture` and
+# `mempalace mine --source codex` must both resolve the name without the user
+# installing anything. Explicit registration also wins over entry points (§3.2).
+register("codex", CodexSessionAdapter)
+
 __all__ = [
     "AdapterClosedError",
+    "CodexSessionAdapter",
     "AdapterSchema",
     "AuthRequiredError",
     "BaseSourceAdapter",
