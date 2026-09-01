@@ -335,13 +335,12 @@ class TestEmitBounded:
         assert chunks == []
 
     def test_small_trailing_slice_preserved(self):
-        """Once the whole content passes the floor, every slice is emitted
-        verbatim so small trailing remainders are not silently dropped.
-        Regression test for the data-loss class flagged on PR #1538."""
+        """Small trailing remainders are never dropped (PR #1538) — they
+        fold into the previous slice so no orphan fragment drawer exists."""
         chunks = []
         _emit_bounded(chunks, "z" * 23, chunk_size=10, min_chunk_size=5)
-        assert len(chunks) == 3
-        assert [len(c["content"]) for c in chunks] == [10, 10, 3]
+        assert len(chunks) == 2
+        assert [len(c["content"]) for c in chunks] == [10, 13]
         assert "".join(c["content"] for c in chunks) == "z" * 23
 
     def test_trailing_whitespace_slice_preserved_when_whole_passes(self):
@@ -350,9 +349,8 @@ class TestEmitBounded:
         The floor is a noise filter on the WHOLE input, not a per-slice gate."""
         chunks = []
         _emit_bounded(chunks, "a" * 10 + " " * 10, chunk_size=10, min_chunk_size=5)
-        assert len(chunks) == 2
-        assert chunks[0]["content"] == "a" * 10
-        assert chunks[1]["content"] == " " * 10
+        assert len(chunks) == 1
+        assert chunks[0]["content"] == "a" * 10 + " " * 10
 
     def test_only_truly_empty_content_dropped(self):
         """Only zero-content input (empty or all-whitespace after strip) is
@@ -366,15 +364,13 @@ class TestEmitBounded:
         assert chunks[0]["content"] == "ab"
 
     def test_split_805_chars_at_chunk_size_800_preserves_tail(self):
-        """805 chars at chunk_size=800 produces a 5-char tail. With the
-        whole-content floor (not per-slice), the 5-char tail is preserved
-        verbatim. Directly addresses the data-loss scenario raised on PR #1538."""
+        """805 chars at chunk_size=800 leaves a 5-char tail. It is preserved
+        verbatim (PR #1538) by folding into the previous chunk — never as a
+        standalone fragment drawer, never dropped."""
         chunks = []
         _emit_bounded(chunks, "y" * 805, chunk_size=800, min_chunk_size=30)
-        assert len(chunks) == 2
-        assert chunks[0]["content"] == "y" * 800
-        assert chunks[1]["content"] == "y" * 5
-        assert "".join(c["content"] for c in chunks) == "y" * 805
+        assert len(chunks) == 1
+        assert chunks[0]["content"] == "y" * 805
 
 
 class TestDetectConvoRoom:
@@ -1126,3 +1122,28 @@ def test_scan_convos_accepts_one_file_without_scanning_siblings(
     )
 
     assert scan_convos(str(selected)) == [selected.resolve()]
+
+
+def test_split_tail_folds_into_previous_chunk():
+    """A sub-minimum tail of an oversize split must not become a standalone
+    drawer (mid-word fragments polluted search); it folds into the previous
+    chunk verbatim instead."""
+    chunks = []
+    body = "x" * 100 + "tail."
+    _emit_bounded(chunks, body, chunk_size=100, min_chunk_size=30)
+    assert len(chunks) == 1
+    assert chunks[0]["content"] == body  # nothing lost, nothing orphaned
+
+
+def test_short_whole_message_still_kept_standalone():
+    chunks = []
+    _emit_bounded(chunks, "> yes do it\nDone.", chunk_size=100, min_chunk_size=30)
+    assert len(chunks) == 1
+    assert chunks[0]["content"] == "> yes do it\nDone."
+
+
+def test_long_tail_still_emitted_separately():
+    chunks = []
+    body = "a" * 100 + "b" * 50
+    _emit_bounded(chunks, body, chunk_size=100, min_chunk_size=30)
+    assert [c["content"] for c in chunks] == ["a" * 100, "b" * 50]

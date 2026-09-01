@@ -454,8 +454,18 @@ def _emit_bounded(
     """
     if not content.strip():
         return
-    for i in range(0, len(content), chunk_size):
-        chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
+    slices = [content[i : i + chunk_size] for i in range(0, len(content), chunk_size)]
+    # A short trailing slice of a *split* message is an orphan fragment, not
+    # a standalone memory — filed alone it surfaces in search as mid-word
+    # noise ("ция нетронута…"). Fold it into the previous slice instead:
+    # nothing is lost, and the last chunk may exceed chunk_size by less
+    # than min_chunk_size. A short *whole* message (single slice) is still
+    # kept as-is — that is the decision class the floor used to eat.
+    if len(slices) > 1 and len(slices[-1].strip()) < min_chunk_size:
+        tail = slices.pop()
+        slices[-1] += tail
+    for piece in slices:
+        chunks.append({"content": piece, "chunk_index": len(chunks)})
 
 
 def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> list:
