@@ -2030,6 +2030,33 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_doctor(args):
+    """Run every mempalace health check and report ok/warn/fail per check."""
+    import json as _json
+
+    from . import doctor
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    results = doctor.run_all(
+        palace_path,
+        full_secrets_scan=getattr(args, "full", False),
+        sample_n=getattr(args, "sample", None) or doctor.DEFAULT_SAMPLE_DRAWERS,
+        sessions_root=getattr(args, "sessions_root", None),
+        backup_dest=getattr(args, "backup_dest", None),
+        home=getattr(args, "home", None),
+    )
+    exit_code = doctor.overall_exit_code(results)
+
+    if getattr(args, "json", False):
+        print(_json.dumps({"results": [r.to_dict() for r in results], "exit_code": exit_code}, indent=2))
+    else:
+        print("\n  mempalace doctor\n")
+        print(doctor.format_table(results))
+        print()
+
+    sys.exit(exit_code)
+
+
 def cmd_update(args):
     """Configure, check, or prepare updates without installing automatically."""
     import json
@@ -4293,6 +4320,23 @@ def main():
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_doctor = sub.add_parser("doctor", help="Run every mempalace health check")
+    p_doctor.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_doctor.add_argument(
+        "--full",
+        action="store_true",
+        help="Scan every drawer for secrets instead of a bounded sample",
+    )
+    p_doctor.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Number of drawers to sample for the secrets check (default: 5000)",
+    )
+    p_doctor.add_argument("--sessions-root", default=None, help="Override Codex sessions root")
+    p_doctor.add_argument("--backup-dest", default=None, help="Override backup destination directory")
+    p_doctor.add_argument("--home", default=None, help="Override home directory (for launchd/service checks)")
+
     p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
     update_sub = p_update.add_subparsers(dest="update_action")
     p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
@@ -4711,6 +4755,7 @@ def main():
         "hallways": cmd_hallways,
         "dedup": cmd_dedup,
         "status": cmd_status,
+        "doctor": cmd_doctor,
         "update": cmd_update,
     }
     dispatch[args.command](args)
