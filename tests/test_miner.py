@@ -1041,7 +1041,8 @@ def test_status_aborts_on_hnsw_divergence(tmp_path, capsys):
         status(str(tmp_path))
 
     out = capsys.readouterr().out
-    assert "HNSW index is diverged" in out
+    assert "search_degraded" in out
+    assert "HNSW index diverged" in out
     assert "MemPalace Status" not in out
 
 

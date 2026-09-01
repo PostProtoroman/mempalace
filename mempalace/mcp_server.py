@@ -82,6 +82,7 @@ from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
+    DEFAULT_CANDIDATE_STRATEGY,
     SearchError,
     _distance_to_similarity,
     _metric_for_collection,
@@ -1979,6 +1980,13 @@ def _tool_status_via_sqlite() -> dict:
         "backend": "chroma",
         "vector_disabled": True,
         "vector_disabled_reason": _vector_disabled_reason,
+        # Recovery-doc-facing name (docs/recovery/index-metadata-recovery.md):
+        # a quarantined/diverged HNSW segment degrades search silently
+        # (falls back to BM25-only) unless something surfaces it. Alias of
+        # vector_disabled/_reason kept in sync so callers checking either
+        # name see the same state.
+        "search_degraded": True,
+        "search_degraded_reason": _vector_disabled_reason,
     }
     if _vector_capacity_status:
         result["hnsw_capacity"] = {
@@ -2203,6 +2211,7 @@ def tool_status():
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
             "backend": _selected_backend_name(),
+            "search_degraded": False,
         }
 
     # Use create=True only when a palace DB already exists on disk -- this
@@ -2220,6 +2229,7 @@ def tool_status():
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "search_degraded": False,
         "backend": _selected_backend_name(),
     }
     try:
@@ -2467,7 +2477,7 @@ def tool_search(
     max_distance: float = None,
     min_similarity: float = None,
     context: str = None,
-    candidate_strategy: str = "vector",
+    candidate_strategy: str = DEFAULT_CANDIDATE_STRATEGY,
     cli_compatible: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
@@ -2479,7 +2489,7 @@ def tool_search(
         return {"error": str(e)}
     # since/before are validated inside search_memories (shared
     # parse_window), which returns the same {"error": ...} shape.
-    candidate_strategy = candidate_strategy or "vector"
+    candidate_strategy = candidate_strategy or DEFAULT_CANDIDATE_STRATEGY
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
     # Mitigate system prompt contamination (Issue #333)
@@ -2491,7 +2501,11 @@ def tool_search(
         if source_file is not None:
             return {"error": "cli-compatible search does not support source_file"}
         unsupported_controls = []
-        if candidate_strategy != "vector":
+        # cli_compatible always defers to `cli_search`'s (searcher.search's)
+        # own default strategy (DEFAULT_CANDIDATE_STRATEGY) — it has no way
+        # to honor an override. Only flag it when the caller explicitly
+        # asked for something other than that default.
+        if candidate_strategy != DEFAULT_CANDIDATE_STRATEGY:
             unsupported_controls.append("candidate_strategy")
         if min_similarity is not None:
             unsupported_controls.append("min_similarity")
@@ -5400,7 +5414,7 @@ TOOLS = {
                 "candidate_strategy": {
                     "type": "string",
                     "enum": ["vector", "union"],
-                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                    "description": "Candidate source strategy. 'union' (default) merges backend BM25 lexical candidates into the vector pool before reranking, so exact-token matches that embed far from the query aren't missed; 'vector' preserves the cheaper vector-only pool.",
                 },
                 "cli_compatible": {
                     "type": "boolean",

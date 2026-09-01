@@ -385,7 +385,9 @@ class TestSearchMemories:
             patch("mempalace.searcher.get_collection", return_value=drawers_col),
             patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
         ):
-            result = search_memories("query term", "/fake/path", n_results=3)
+            result = search_memories(
+                "query term", "/fake/path", n_results=3, candidate_strategy="vector"
+            )
 
         sources = [hit["source_path"] for hit in result["results"]]
         assert sources.count(jsonl) == 1, sources
