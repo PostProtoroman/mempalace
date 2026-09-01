@@ -22,6 +22,7 @@ from mempalace.normalize import (
     _try_slack_json,
     normalize,
     normalize_conversations,
+    normalize_conversations_checked,
     strip_noise,
 )
 
@@ -2378,3 +2379,65 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── normalize_conversations_checked() — unparsed-structured flag ──────────
+
+
+def test_checked_flags_unparsed_structured_json(tmp_path):
+    """A .json file no parser recognizes is flagged for quarantine; the raw
+    content is still returned for backward compatibility."""
+    f = tmp_path / "mystery.json"
+    raw = json.dumps({"records": [{"foo": "bar"}, {"baz": [1, 2, 3]}]})
+    f.write_text(raw, encoding="utf-8")
+
+    conversations, unparsed = normalize_conversations_checked(str(f))
+    assert unparsed is True
+    assert conversations == [raw]
+    # The compat wrapper is unchanged.
+    assert normalize_conversations(str(f)) == [raw]
+
+
+def test_checked_flags_unparsed_structured_jsonl(tmp_path):
+    f = tmp_path / "mystery.jsonl"
+    f.write_text('{"a": 1}\n{"b": 2}\n', encoding="utf-8")
+    _, unparsed = normalize_conversations_checked(str(f))
+    assert unparsed is True
+
+
+def test_checked_does_not_flag_plain_text(tmp_path):
+    f = tmp_path / "notes.txt"
+    f.write_text("{ starts with a brace but is prose }\n\nSecond paragraph.", encoding="utf-8")
+    conversations, unparsed = normalize_conversations_checked(str(f))
+    assert unparsed is False
+    assert len(conversations) == 1
+
+
+def test_checked_does_not_flag_parsed_export(tmp_path):
+    f = tmp_path / "chat.json"
+    f.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    conversations, unparsed = normalize_conversations_checked(str(f))
+    assert unparsed is False
+    assert conversations and conversations[0].startswith("> Q1")
+
+
+def test_checked_does_not_flag_transcript_with_markers(tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text("> q1\na1\n> q2\na2\n> q3\na3\n", encoding="utf-8")
+    conversations, unparsed = normalize_conversations_checked(str(f))
+    assert unparsed is False
+    assert len(conversations) == 1
+
+
+def test_checked_empty_file_not_flagged(tmp_path):
+    f = tmp_path / "empty.json"
+    f.write_text("", encoding="utf-8")
+    assert normalize_conversations_checked(str(f)) == ([], False)

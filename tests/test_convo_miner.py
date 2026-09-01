@@ -79,24 +79,33 @@ def test_mine_convos_end_to_end_redacts_secret_and_reports_summary(monkeypatch, 
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """Short files are FILED verbatim (short content is content, not
+    noise — 2026-09-01) and still skipped on re-run via the stored mtime."""
     tmpdir = tempfile.mkdtemp()
     try:
-        # A file too short to produce any chunks
+        # A very short file — used to be dropped below MIN_CHUNK_SIZE,
+        # now filed as a real drawer.
         with open(os.path.join(tmpdir, "tiny.txt"), "w") as f:
             f.write("hi")
 
         palace_path = os.path.join(tmpdir, "palace")
 
-        # First run -- file is processed (sentinel written)
+        # First run -- file is processed and filed
         mine_convos(tmpdir, palace_path, wing="test")
         capsys.readouterr()  # drain output
 
-        # Verify sentinel was written (resolve path -- macOS /var -> /private/var)
+        # Verify it was filed (resolve path -- macOS /var -> /private/var)
         resolved_file = str(Path(tmpdir).resolve() / "tiny.txt")
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        rows = col.get(where={"source_file": resolved_file}, include=["documents", "metadatas"])
+        real = [
+            doc
+            for doc, meta in zip(rows["documents"], rows["metadatas"])
+            if (meta or {}).get("ingest_mode") != "registry"
+        ]
+        assert real == ["hi"], "short content must be filed verbatim, not dropped"
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")
@@ -1224,3 +1233,88 @@ def test_mine_convos_dry_run_single_file_does_not_scan_siblings(
     assert "[DRY RUN] selected.txt" in output
     assert "sibling.txt" not in output
     assert not palace_path.exists()
+
+
+def test_mine_convos_quarantines_unparseable_structured_files(tmp_path, capsys, caplog):
+    """A .json/.jsonl file that looks like a chat export but is declined by
+    every parser must be QUARANTINED — skipped, counted, and warned about —
+    not paragraph-chunked into garbage drawers (2026-09-01)."""
+    import logging
+
+    # Structured JSON no chat parser recognizes.
+    (tmp_path / "mystery.json").write_text(
+        json.dumps({"records": [{"foo": "bar" * 50}, {"baz": [1, 2, 3]}]}),
+        encoding="utf-8",
+    )
+    palace_path = tmp_path / "palace"
+
+    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+        mine_convos(str(tmp_path), str(palace_path), wing="test")
+    captured = capsys.readouterr()
+
+    assert "Files quarantined (unparseable structured): 1" in captured.out
+    assert "Drawers filed: 0" in captured.out
+    assert "QUARANTINE: mystery.json" in captured.err
+    assert any(
+        "quarantined" in rec.getMessage() and "mystery.json" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected a warning log naming the quarantined file"
+
+    # No drawers (and no sentinel) were written for the quarantined file.
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    resolved = str((tmp_path / "mystery.json").resolve())
+    rows = col.get(where={"source_file": resolved})
+    assert rows["ids"] == [], "quarantined file must not produce drawers"
+
+
+def test_mine_convos_plain_txt_with_json_content_keeps_paragraph_path(tmp_path, capsys):
+    """Quarantine applies only to structured .json/.jsonl files. A plain
+    .txt file whose content merely starts with '{' keeps the existing
+    paragraph path."""
+    (tmp_path / "notes.txt").write_text(
+        "{ this is a note that merely opens with a brace }\n\n"
+        "It continues with an ordinary paragraph about the project plan.\n",
+        encoding="utf-8",
+    )
+    palace_path = tmp_path / "palace"
+
+    mine_convos(str(tmp_path), str(palace_path), wing="test")
+    out = capsys.readouterr().out
+
+    assert "Files quarantined" not in out
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    resolved = str((tmp_path / "notes.txt").resolve())
+    rows = col.get(where={"source_file": resolved}, include=["documents", "metadatas"])
+    real = [
+        doc
+        for doc, meta in zip(rows["documents"], rows["metadatas"])
+        if (meta or {}).get("ingest_mode") != "registry"
+    ]
+    assert real, ".txt content must still be filed via the paragraph path"
+
+
+def test_mine_convos_stamps_chunker_version(tmp_path, capsys):
+    """Re-mined drawers must be distinguishable from old-chunker drawers via
+    the chunker_version metadata marker."""
+    from mempalace.convo_miner import CONVO_CHUNKER_VERSION
+
+    (tmp_path / "chat.txt").write_text(
+        "> What is memory?\nMemory is persistence.\n\n"
+        "> Why?\nContinuity.\n\n"
+        "> How?\nStructured storage.\n",
+        encoding="utf-8",
+    )
+    palace_path = tmp_path / "palace"
+    mine_convos(str(tmp_path), str(palace_path), wing="test")
+    capsys.readouterr()
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    resolved = str((tmp_path / "chat.txt").resolve())
+    rows = col.get(where={"source_file": resolved}, include=["metadatas"])
+    assert rows["metadatas"], "expected drawers for the transcript"
+    assert all(
+        meta.get("chunker_version") == CONVO_CHUNKER_VERSION for meta in rows["metadatas"]
+    ), "every convo drawer must carry the chunker_version marker"
