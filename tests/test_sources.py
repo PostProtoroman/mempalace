@@ -458,3 +458,31 @@ def test_entry_point_group_exists_and_returns_zero_or_more_adapters():
     # party packages can register. ``available_adapters`` MUST NOT raise.
     adapters = available_adapters()
     assert isinstance(adapters, list)
+
+
+def test_palace_context_upsert_drawer_redacts_secrets():
+    """upsert_drawer is the single adapter-side write choke point, so
+    ingest-time redaction must apply here — a Codex transcript quoting a
+    live key must never reach the drawer collection verbatim."""
+    drawers = _FakeCollection()
+    ctx = PalaceContext(
+        drawer_collection=drawers,
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/palace",
+        adapter_name="codex",
+        adapter_version="0.1.0",
+    )
+    secret = "sk-ant-" + "a1B2" * 8
+    ctx.upsert_drawer(
+        DrawerRecord(
+            content=f"the key is {secret} — keep it safe",
+            source_file="/abs/rollout.jsonl",
+            chunk_index=0,
+            metadata={"wing": "proj"},
+        )
+    )
+    stored = drawers.upserts[0]["documents"][0]
+    assert secret not in stored
+    assert "[redacted:anthropic_key]" in stored
+    assert "keep it safe" in stored
+    assert ctx.redaction_counts.get("anthropic_key") == 1

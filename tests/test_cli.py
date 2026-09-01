@@ -2325,3 +2325,29 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_source_adapter_bypasses_ai_tool_guard(mock_config_cls):
+    """`--source <adapter>` owns its own extraction and never walks raw
+    files, so the project-mode AI-tool-dir refusal must not fire for it —
+    `mempalace mine ~/.codex --source codex` is the sanctioned flow even
+    though mode defaults to "projects" alongside --source."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/home/user/.codex",
+        palace=None,
+        mode=None,
+        source="codex",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.cli.mine_source_adapter", return_value=3) as mock_adapter:
+        cmd_mine(args)
+    mock_adapter.assert_called_once()
+    assert mock_adapter.call_args.kwargs["source_name"] == "codex"

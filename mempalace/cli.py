@@ -966,7 +966,11 @@ def cmd_mine(args):
     # --daemon / --background dispatch below so a daemon-submitted job can't
     # bypass it either. `--mode convos` is unaffected: that path already
     # exists to mine exactly this kind of directory correctly.
-    if mode == "projects":
+    # A --source adapter owns its own extraction and never walks raw files,
+    # so the AI-tool-dir refusal below must not fire for it (mode still
+    # defaults to "projects" when --source is given, as the two flags are
+    # mutually exclusive).
+    if mode == "projects" and not source_adapter:
         from .convo_miner import _is_ai_tool_path
 
         if _is_ai_tool_path(Path(os.path.expanduser(args.dir))):
@@ -1263,6 +1267,10 @@ def mine_source_adapter(
                     f"source adapter {adapter_name!r} yielded unsupported result type "
                     f"{type(result).__name__}"
                 )
+            if context.redaction_counts:
+                from .redact import print_redaction_summary
+
+                print_redaction_summary(context.redaction_counts)
             return drawers_written
         finally:
             if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
@@ -1300,7 +1308,11 @@ def cmd_codex_capture(args):
                 file=sys.stderr,
             )
             return 1
-        plan = plan_backfill(palace_path, sessions_root)
+        plan = plan_backfill(
+            palace_path,
+            sessions_root,
+            include_automation=getattr(args, "include_automation", False),
+        )
         print("\n  Backfill plan (nothing written):")
         print(f"    Rollout files scanned:      {plan['files_scanned']}")
         print(f"    Conversation turns found:   {plan['turns_found']}")

@@ -600,3 +600,31 @@ def test_recall_block_tells_the_agent_to_search_first():
     block = codex_recall.recall_block().lower()
     assert "mempalace_search" in block
     assert "verbatim" in block
+
+
+def test_scan_once_redacts_secrets_before_write(tmp_path):
+    """A rollout quoting a live key must reach the palace redacted — the
+    follower's direct-upsert path is outside the adapter choke point and
+    needs its own scrub (the 2026-09-01 audit found 77 keys stored verbatim
+    by the previous deployment)."""
+    root = tmp_path / "sessions"
+    palace = str(tmp_path / "palace")
+    secret = "sk-ant-" + "z9Y8" * 8
+    _write_rollout(
+        root,
+        "leak",
+        [
+            _meta(),
+            _item("user", "u1", f"my key is {secret} please use it", 1),
+            _item("assistant", "a1", "never paste keys in chat", 2),
+        ],
+    )
+    stats = scan_once(palace, str(root), backfill=True)
+    assert stats["secrets_redacted"] == 1
+    from mempalace.palace import get_collection
+
+    col = get_collection(palace, create=True)
+    docs = col.get(include=["documents"])["documents"]
+    joined = "\n".join(docs)
+    assert secret not in joined
+    assert "[redacted:anthropic_key]" in joined

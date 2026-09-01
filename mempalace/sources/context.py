@@ -78,6 +78,10 @@ class PalaceContext:
     adapter_version: str = ""
     progress_hooks: list[ProgressHook] = field(default_factory=list)
 
+    # Secret redactions applied by upsert_drawer this invocation, by kind.
+    # Core reads this after ingest to surface a non-silent summary.
+    redaction_counts: dict = field(default_factory=dict)
+
     # Internal: flag set by :meth:`skip_current_item` and checked by the core
     # mine loop between yields. Not part of the adapter-facing contract; the
     # adapter only needs to know that calling :meth:`skip_current_item` stops
@@ -102,8 +106,17 @@ class PalaceContext:
         if self.adapter_version:
             meta.setdefault("adapter_version", self.adapter_version)
         drawer_id = _build_drawer_id(record)
+        # Every adapter write funnels through here, so this is the one place
+        # ingest-time secret redaction covers the whole RFC 002 surface.
+        from ..config import MempalaceConfig
+        from ..redact import redact_if_enabled
+
+        cfg = self.config if self.config is not None else MempalaceConfig()
+        content = redact_if_enabled(
+            record.content, getattr(cfg, "redaction_enabled", True), self.redaction_counts
+        )
         self.drawer_collection.upsert(
-            documents=[record.content],
+            documents=[content],
             ids=[drawer_id],
             metadatas=[meta],
         )

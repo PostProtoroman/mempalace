@@ -162,8 +162,17 @@ def _baseline_for(activation: Optional[dict], rollout_stem: str) -> Optional[int
     return value if isinstance(value, int) else None
 
 
-def plan_backfill(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict:
-    """What a ``--backfill`` would import, without writing anything."""
+def plan_backfill(
+    palace_path: str,
+    sessions_root: str = DEFAULT_SESSIONS_ROOT,
+    *,
+    include_automation: bool = False,
+) -> dict:
+    """What a ``--backfill`` would import, without writing anything.
+
+    ``include_automation`` must mirror the flag the real backfill will run
+    with — otherwise the plan and the import diverge on automation files.
+    """
     from .palace import get_collection
 
     try:
@@ -183,14 +192,14 @@ def plan_backfill(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) 
     for rollout in iter_rollouts(sessions_root):
         files += 1
         info = classify_rollout(str(rollout))
-        if info.get("automation"):
+        if info.get("automation") and not include_automation:
             automations += 1
             continue
         is_subagent = info.get("thread_source") == "subagent"
         if is_subagent:
             subagent_files += 1
         try:
-            rollout_turns = list(iter_turns(str(rollout)))
+            rollout_turns = list(iter_turns(str(rollout), include_automation=include_automation))
         except OSError:
             continue
         ids = [t.drawer_id for t in rollout_turns]
@@ -277,6 +286,12 @@ def scan_once(
     if own_collection:
         collection = get_collection(palace_path, create=True)
 
+    from .config import MempalaceConfig
+    from .redact import redact_if_enabled
+
+    redaction_enabled = MempalaceConfig().redaction_enabled
+    redaction_counts: dict[str, int] = {}
+
     activation = None if backfill else read_activation(palace_path)
     added = already = skipped = 0
     before_activation = 0
@@ -301,7 +316,7 @@ def scan_once(
         for drawer_id, doc, meta in zip(batch_ids, batch_docs, batch_metas):
             deduped[drawer_id] = (doc, meta)
         ids = list(deduped)
-        docs = [deduped[i][0] for i in ids]
+        docs = [redact_if_enabled(deduped[i][0], redaction_enabled, redaction_counts) for i in ids]
         metas = [deduped[i][1] for i in ids]
         try:
             existing = collection.get(ids=ids, include=[])
@@ -386,6 +401,12 @@ def scan_once(
 
     _flush()
 
+    if redaction_counts:
+        logger.warning(
+            "codex follower: redacted %d secret(s) before write: %s",
+            sum(redaction_counts.values()),
+            dict(sorted(redaction_counts.items())),
+        )
     return {
         "files_scanned": files_scanned,
         "files_automation_skipped": files_automation_skipped,
@@ -393,6 +414,7 @@ def scan_once(
         "threads_seen": len(threads),
         "drawers_added": added,
         "drawers_already_present": already,
+        "secrets_redacted": sum(redaction_counts.values()),
         "subagent_turns_routed": subagent_turns_routed,
         "automation_turns_captured": automation_turns_captured,
         "turns_skipped_by_cursor": skipped,
