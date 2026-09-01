@@ -337,14 +337,14 @@ def test_identity_hygiene_flags_known_alias(collection, palace_path):
 # ── orchestration ─────────────────────────────────────────────────────
 
 
-def test_run_all_returns_eight_checks(tmp_dir, monkeypatch):
+def test_run_all_returns_nine_checks(tmp_dir, monkeypatch):
     monkeypatch.setattr(doctor.platform, "system", lambda: "Linux")
     results = doctor.run_all(
         os.path.join(tmp_dir, "palace"),
         backup_dest=os.path.join(tmp_dir, "backups"),
         sessions_root=os.path.join(tmp_dir, "sessions"),
     )
-    assert len(results) == 8
+    assert len(results) == 9
     assert {r.name for r in results} == set(doctor.CHECK_ORDER)
 
 
@@ -397,7 +397,7 @@ def test_cli_doctor_json_shape(tmp_dir, monkeypatch, capsys):
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert "results" in payload
-    assert len(payload["results"]) == 8
+    assert len(payload["results"]) == 9
     assert exc_info.value.code in (0, 1)
 
 
@@ -420,6 +420,196 @@ def test_cli_doctor_table_output(tmp_dir, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "mempalace doctor" in out
+
+
+class TestRogueLeaseHolder:
+    """`check_rogue_lease_holder` — reads `mine_palace_lock`'s state without
+    ever acquiring it, and cross-checks the holder against the hub.
+
+    Lock contention is simulated with a genuine second process (spawn
+    context, mirroring tests/test_palace_locks.py) since flock semantics
+    can't be faked within a single process/thread.
+    """
+
+    @staticmethod
+    def _isolate_home(monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    @staticmethod
+    def _write_hub_plist(home_dir):
+        import plistlib
+
+        agents_dir = os.path.join(home_dir, "Library", "LaunchAgents")
+        os.makedirs(agents_dir, exist_ok=True)
+        with open(os.path.join(agents_dir, "ai.mempalace.hub.plist"), "wb") as f:
+            plistlib.dump(
+                {
+                    "Label": "ai.mempalace.hub",
+                    "ProgramArguments": ["/venv/bin/python", "-m", "mempalace", "serve"],
+                },
+                f,
+            )
+
+    def test_non_macos_skips(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Linux")
+        result = doctor.check_rogue_lease_holder(str(tmp_path / "palace"), home=str(tmp_path))
+        assert result.status == "ok"
+        assert "not macOS" in result.reason
+
+    def test_no_hub_plist_is_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        result = doctor.check_rogue_lease_holder(str(tmp_path / "palace"), home=str(tmp_path))
+        assert result.status == "ok"
+        assert "single-writer" in result.reason
+
+    def test_free_lease_is_ok(self, tmp_path, monkeypatch):
+        """A lock file that exists but is unheld (stale identity from a prior
+        holder still on disk) must probe as free, not as held."""
+        from mempalace.palace import mine_palace_lock
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        palace = str(tmp_path / "palace")
+
+        with mine_palace_lock(palace):
+            pass  # acquire and release synchronously -- leaves a lock file behind
+
+        result = doctor.check_rogue_lease_holder(palace, home=str(tmp_path))
+        assert result.status == "ok"
+        assert "free" in result.reason
+
+    def test_no_lock_file_at_all_is_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        result = doctor.check_rogue_lease_holder(str(tmp_path / "palace"), home=str(tmp_path))
+        assert result.status == "ok"
+        assert "free" in result.reason
+
+    def test_held_by_non_hub_process_warns(self, tmp_path, monkeypatch):
+        from tests.test_palace_locks import _get_mp_context, _hold_lock_with_argv
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(doctor, "_hub_launchd_pid", lambda home=None: None)
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        palace = str(tmp_path / "palace")
+        ready = str(tmp_path / "ready")
+        release = str(tmp_path / "release")
+
+        ctx = _get_mp_context()
+        pid_q = ctx.Queue()
+        holder = ctx.Process(
+            target=_hold_lock_with_argv,
+            args=(palace, ["mempalace", "codex-capture", "--interval"], ready, release, pid_q),
+        )
+        holder.start()
+        try:
+            for _ in range(500):
+                if os.path.exists(ready):
+                    break
+                time.sleep(0.01)
+            assert os.path.exists(ready), "holder failed to acquire lock in time"
+            holder_pid, holder_argv = pid_q.get(timeout=2)
+
+            result = doctor.check_rogue_lease_holder(palace, home=str(tmp_path))
+            assert result.status == "warn"
+            assert f"PID {holder_pid}" in result.reason
+            assert "not the hub" in result.reason
+            assert result.details["pid"] == holder_pid
+            assert "--transport http" not in " ".join(holder_argv)
+            assert "seized the writer lease" in result.hint
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+
+    def test_held_by_hub_cmdline_is_ok(self, tmp_path, monkeypatch):
+        """Recorded identity carrying '--transport http' (the hub's own
+        exec'd argv) is enough to clear it, even without a launchd PID
+        match."""
+        from tests.test_palace_locks import _get_mp_context, _hold_lock_with_argv
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(doctor, "_hub_launchd_pid", lambda home=None: None)
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        palace = str(tmp_path / "palace")
+        ready = str(tmp_path / "ready")
+        release = str(tmp_path / "release")
+
+        ctx = _get_mp_context()
+        pid_q = ctx.Queue()
+        holder = ctx.Process(
+            target=_hold_lock_with_argv,
+            args=(palace, ["/venv/bin/python", "--transport", "http"], ready, release, pid_q),
+        )
+        holder.start()
+        try:
+            for _ in range(500):
+                if os.path.exists(ready):
+                    break
+                time.sleep(0.01)
+            assert os.path.exists(ready), "holder failed to acquire lock in time"
+
+            result = doctor.check_rogue_lease_holder(palace, home=str(tmp_path))
+            assert result.status == "ok"
+            assert "held by the hub" in result.reason
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+
+    def test_held_by_matching_launchd_pid_is_ok(self, tmp_path, monkeypatch):
+        """A holder whose command line doesn't say '--transport http' still
+        clears as the hub when its PID matches the launchd job's PID."""
+        from tests.test_palace_locks import _get_mp_context, _hold_lock_with_argv
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        palace = str(tmp_path / "palace")
+        ready = str(tmp_path / "ready")
+        release = str(tmp_path / "release")
+
+        ctx = _get_mp_context()
+        pid_q = ctx.Queue()
+        holder = ctx.Process(
+            target=_hold_lock_with_argv,
+            args=(palace, ["/venv/bin/python", "-m", "mempalace"], ready, release, pid_q),
+        )
+        holder.start()
+        try:
+            for _ in range(500):
+                if os.path.exists(ready):
+                    break
+                time.sleep(0.01)
+            assert os.path.exists(ready), "holder failed to acquire lock in time"
+            holder_pid, _holder_argv = pid_q.get(timeout=2)
+
+            monkeypatch.setattr(doctor, "_hub_launchd_pid", lambda home=None: holder_pid)
+            result = doctor.check_rogue_lease_holder(palace, home=str(tmp_path))
+            assert result.status == "ok"
+            assert "held by the hub" in result.reason
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+
+    def test_never_leaves_the_lock_held(self, tmp_path, monkeypatch):
+        """Probing a free lease must not leave it locked for a real acquirer."""
+        from mempalace.palace import mine_palace_lock
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        self._isolate_home(monkeypatch, tmp_path)
+        self._write_hub_plist(str(tmp_path))
+        palace = str(tmp_path / "palace")
+
+        result = doctor.check_rogue_lease_holder(palace, home=str(tmp_path))
+        assert result.status == "ok"
+
+        # If the probe leaked its flock, this would raise MineAlreadyRunning.
+        with mine_palace_lock(palace):
+            pass
 
 
 class TestUpstreamDrift:

@@ -554,6 +554,196 @@ def check_identity_hygiene(palace_path: str) -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
+# 8. Rogue lease holder (macOS only) — palace writer lease held by a
+#    non-hub process while a hub launchd job is installed.
+# ---------------------------------------------------------------------------
+
+
+def _read_mine_lock_state(palace_path: str) -> dict:
+    """Read `mine_palace_lock`'s current state for ``palace_path`` without
+    ever acquiring or holding it.
+
+    Tries a non-blocking exclusive flock on the same lock file
+    `mine_palace_lock` uses: if it succeeds, the lease is free, and it is
+    released immediately — this function never leaves the lock held. If it
+    fails, the lease is held by someone else; the holder's identity
+    (written by ``palace._write_lock_holder`` as ``"<pid> <argv0> <argv1>
+    <argv2>"`` from byte 1 onward — byte 0 is the OS lock sentinel) is read
+    back, along with the lock file's mtime as a best-effort proxy for how
+    long it has been held (the holder truncates+writes+flushes that region
+    right after acquiring, so mtime tracks the most recent acquire).
+
+    POSIX only (``fcntl.flock``) — callers must gate on macOS themselves;
+    this is never reached on Windows since the check that calls it skips
+    off-Darwin before probing.
+    """
+    import fcntl
+
+    from .palace import _LOCK_SENTINEL_BYTES, _format_lock_holder, mine_palace_lock_path
+
+    lock_path = mine_palace_lock_path(palace_path)
+    free = {
+        "held": False,
+        "pid": None,
+        "cmdline": None,
+        "age_hours": None,
+        "holder_label": None,
+        "lock_path": lock_path,
+    }
+    if not os.path.exists(lock_path):
+        return free
+
+    lf = open(lock_path, "rb")
+    try:
+        lf.seek(0)
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lf, fcntl.LOCK_UN)
+            return free
+        except BlockingIOError:
+            pass  # held by someone else -- read their recorded identity below
+
+        lf.seek(_LOCK_SENTINEL_BYTES)
+        content = lf.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        content = content.strip()
+
+        pid = None
+        cmdline = None
+        if content:
+            parts = content.split(maxsplit=1)
+            if parts and parts[0].isdigit():
+                pid = int(parts[0])
+                cmdline = parts[1].strip() if len(parts) > 1 else ""
+
+        age_hours = None
+        try:
+            age_hours = (time.time() - os.path.getmtime(lock_path)) / 3600.0
+        except OSError:
+            pass
+
+        return {
+            "held": True,
+            "pid": pid,
+            "cmdline": cmdline,
+            "age_hours": age_hours,
+            "holder_label": _format_lock_holder(content)
+            if content
+            else "another writer (identity not recorded)",
+            "lock_path": lock_path,
+        }
+    finally:
+        lf.close()
+
+
+def _hub_launchd_pid(home: "str | None" = None) -> "int | None":
+    """Best-effort PID of the running ``ai.mempalace.hub`` launchd job.
+
+    A read-only ``launchctl print`` — never bootstrap/bootout/kickstart, in
+    keeping with this module's "never touch live state" rule. Returns None
+    on any failure (not macOS, no launchctl, job not loaded, unparseable
+    output) rather than raising; the caller falls back to the
+    ``--transport http`` command-line signal in that case.
+    """
+    import shutil
+    import subprocess
+
+    if platform.system() != "Darwin" or not shutil.which("launchctl"):
+        return None
+    try:
+        domain = f"gui/{os.getuid()}"
+        result = subprocess.run(
+            ["launchctl", "print", f"{domain}/ai.mempalace.hub"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("pid = "):
+                digits = line.split("=", 1)[1].strip()
+                return int(digits) if digits.isdigit() else None
+    except Exception:
+        return None
+    return None
+
+
+def check_rogue_lease_holder(palace_path: str, home: "str | None" = None) -> CheckResult:
+    """Warn when the palace writer lease (`mine_palace_lock`) is held by a
+    process that is not the hub, while a hub launchd job is installed.
+
+    Once ``ai.mempalace.hub`` is installed, the hub (``mempalace serve``,
+    which execs into ``mempalace.mcp_server --transport http ...``) is meant
+    to hold this lease for its entire lifetime — every other writer routes
+    through it. If a hub restart races a session's own stdio MCP server for
+    the non-blocking flock, that session's process can win and keep the
+    lease past the restart, silently starving the hub of writes until that
+    session's server exits. This check surfaces exactly that scenario
+    without ever acquiring the lock itself.
+
+    A holder is identified as the hub two ways: its recorded command line
+    contains ``--transport http`` (the hub's own exec'd argv), or its PID
+    matches the ``ai.mempalace.hub`` launchd job's PID. Either is enough,
+    since the recorded command line is best-effort (only ``sys.argv[:3]``)
+    and the launchd PID lookup can fail (job not loaded, no launchctl).
+
+    No hub plist installed -> single-writer deployments are normal -> OK.
+    Lease free -> OK. Held by the hub -> OK. Held by anything else while a
+    hub is installed -> WARN.
+    """
+    name = "rogue_lease_holder"
+    if platform.system() != "Darwin":
+        return _ok(name, "not macOS — skipped")
+
+    try:
+        agents_dir = os.path.join(home or os.path.expanduser("~"), "Library", "LaunchAgents")
+        hub_plist = os.path.join(agents_dir, "ai.mempalace.hub.plist")
+        if not os.path.isfile(hub_plist):
+            return _ok(
+                name, "no ai.mempalace.hub launch agent installed -- single-writer deployment"
+            )
+
+        state = _read_mine_lock_state(palace_path)
+        if not state["held"]:
+            return _ok(name, "palace writer lease is free")
+
+        pid = state["pid"]
+        cmdline = state["cmdline"] or ""
+        age_hours = state["age_hours"]
+        holder_label = state["holder_label"]
+
+        hub_pid = _hub_launchd_pid(home=home)
+        is_hub = "--transport http" in cmdline or (
+            pid is not None and hub_pid is not None and pid == hub_pid
+        )
+
+        if is_hub:
+            return _ok(
+                name,
+                f"palace writer lease held by the hub ({holder_label})",
+                pid=pid,
+                cmdline=cmdline,
+            )
+
+        age_str = f"; held for {age_hours:.1f}h" if age_hours is not None else ""
+        return _warn(
+            name,
+            f"palace writer lease is held by {holder_label}, not the hub{age_str}",
+            "a session's stdio server seized the writer lease during a hub restart; "
+            "it releases on exit -- or restart that session's MCP server",
+            pid=pid,
+            cmdline=cmdline,
+            age_hours=age_hours,
+            hub_pid=hub_pid,
+        )
+    except Exception as exc:  # pragma: no cover
+        return _exc_result(name, exc, "inspect ~/.mempalace/locks manually")
+
+
+# ---------------------------------------------------------------------------
 # Orchestration.
 # ---------------------------------------------------------------------------
 
@@ -565,6 +755,7 @@ CHECK_ORDER = (
     "search_health",
     "kg_unification",
     "identity_hygiene",
+    "rogue_lease_holder",
     "upstream_drift",
 )
 
@@ -631,6 +822,7 @@ def run_all(
         check_search_health(palace_path),
         check_kg_unification(palace_path),
         check_identity_hygiene(palace_path),
+        check_rogue_lease_holder(palace_path, home=home),
         check_upstream_drift(),
     ]
 
