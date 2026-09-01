@@ -887,7 +887,7 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
 
     arguments = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
-        "mode": args.mode,
+        "mode": getattr(args, "mode", None) or "projects",
         "agent": args.agent,
         "limit": args.limit or 0,
         "dry_run": bool(args.dry_run),

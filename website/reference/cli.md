@@ -304,3 +304,103 @@ mempalace artifact get art_... --out /tmp/handoff.patch
 |------------|-------------|
 | `put` | Store content (`--kind patch\|file\|log\|json\|note`, `--created-by` required; `--content`, `--file`, or stdin) |
 | `get` | Print exact content to stdout, or `--out FILE`; `--json` for metadata |
+
+## `mempalace backup` / `mempalace restore`
+
+Snapshot the whole palace home — config, hallways/tunnels, `palace/` — into
+a restorable `.tar.gz` archive, and restore one back.
+
+```bash
+mempalace backup --dest ~/.mempalace-backups --keep 7
+mempalace restore mempalace-2026-08-31T120000Z.tar.gz --target /tmp/restored-palace
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `backup` | Write a timestamped archive + manifest to `--dest` (default `~/.mempalace-backups`, outside the palace home). `--keep N` prunes oldest archives past N (default 7; `0` keeps all). |
+| `restore` | Restore an archive produced by `backup` into `--target` (required; must be empty or nonexistent). |
+
+## `mempalace doctor`
+
+Runs every mempalace health check in one pass — config sanity, backend
+reachability, index health, hook wiring — and reports pass/fail per check.
+
+```bash
+mempalace doctor
+```
+
+## `mempalace kg-migrate`
+
+One-time merge of the legacy `~/.mempalace` knowledge graph into the current
+palace's KG. Dry-run by default.
+
+```bash
+mempalace kg-migrate          # preview
+mempalace kg-migrate --apply  # write the merge
+```
+
+## `mempalace identity-migrate`
+
+Re-keys diary drawers filed under a configured `identity.aliases` alias
+(see [Configuration](/guide/configuration#global-config)) to their canonical
+agent name. Metadata-only, idempotent, dry-run by default.
+
+```bash
+mempalace identity-migrate          # preview
+mempalace identity-migrate --apply  # write the migration
+```
+
+## `mempalace hallways prune`
+
+Drops noise hallways (associative graph edges) below a co-occurrence
+threshold. Dry-run by default.
+
+```bash
+mempalace hallways prune --wing myproj --threshold 3
+mempalace hallways prune --apply
+```
+
+## `mempalace dedup`
+
+Finds and optionally removes near-duplicate drawers by cosine distance.
+Dry-run by default.
+
+```bash
+mempalace dedup --stats                 # duplication stats only
+mempalace dedup --wing myproj --source "*.md"
+mempalace dedup --threshold 0.15 --apply
+```
+
+## `mempalace hermes-install`
+
+Copies the Hermes memory-provider plugin into `$HERMES_HOME/plugins/`
+(or `--hermes-home`). Dry run unless `--apply`; pip installs need no copy.
+
+```bash
+mempalace hermes-install
+mempalace hermes-install --apply
+```
+
+## `mempalace codex-capture` / `mempalace codex-service`
+
+`codex-capture` tails `~/.codex/sessions/**/rollout-*.jsonl` and mines new
+Codex CLI turns into the palace as they appear — no `.codex/hooks.json`
+entry required. `codex-service` installs it as a per-user launchd agent
+(macOS only) so it survives terminal exit and comes back at login. See
+[Auto-Save Hooks](/guide/hooks) for how this fits alongside the Codex
+`hooks.json` path.
+
+```bash
+mempalace codex-capture --interval 15
+mempalace codex-service install
+```
+
+## `mempalace logstream cursor`
+
+Durable per-agent resume cursor (last-processed event id), stored next to
+`logstream.sqlite3` — a crash-safe alternative to a hand-rolled state file.
+
+```bash
+mempalace logstream cursor get --agent mac-claude --json
+mempalace logstream cursor set --agent mac-claude --event-id evt_...
+```

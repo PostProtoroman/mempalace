@@ -47,20 +47,33 @@ chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 
 ## Install — Codex CLI
 
-Add to `.codex/hooks.json`:
+Codex hooks are configured **globally**, not per-project: they live in
+`~/.codex/hooks.json` (not a `.codex-plugin/` manifest capability — the
+Codex plugin manifest has no `hooks` field). Codex CLI's schema wraps every
+event under a top-level `"hooks"` key, and each event is a list of matcher
+groups (`matcher` + a `hooks` array), the same nested shape Claude Code
+uses — a flat `{"Stop": [...]}` map is rejected:
 
 ```json
 {
-  "Stop": [{
-    "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
-    "timeout": 30
-  }],
-  "PreCompact": [{
-    "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
-    "timeout": 30
-  }]
+  "hooks": {
+    "Stop": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "timeout": 30
+      }]
+    }],
+    "PreCompact": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "timeout": 30
+      }]
+    }]
+  }
 }
 ```
 
