@@ -284,6 +284,32 @@ def _hold_lock_send_pid(palace_path: str, ready_flag: str, release_flag: str, pi
         pid_q.put(("error", "raised"))
 
 
+def _hold_lock_with_argv(
+    palace_path: str, argv: list, ready_flag: str, release_flag: str, pid_q
+) -> None:
+    """Like `_hold_lock_send_pid`, but fakes `sys.argv` before acquiring so
+    the recorded lock-holder identity (`mine_palace_lock` records
+    ``sys.argv[:3]``) carries a caller-chosen command line.
+
+    Used by tests/test_doctor.py's `TestRogueLeaseHolder` to simulate a
+    holder that looks like the hub (``--transport http`` in argv) or like
+    some other writer, without needing a real hub process.
+    """
+    import sys as _sys
+
+    _sys.argv = list(argv)
+    try:
+        with mine_palace_lock(palace_path):
+            pid_q.put((os.getpid(), list(_sys.argv[:3])))
+            open(ready_flag, "w").close()
+            for _ in range(500):
+                if os.path.exists(release_flag):
+                    return
+                time.sleep(0.01)
+    except MineAlreadyRunning:
+        pid_q.put(("error", "raised"))
+
+
 def test_lock_failure_message_names_holder(tmp_path, monkeypatch):
     """Regression #1264: failed acquire must identify the holder by PID.
 

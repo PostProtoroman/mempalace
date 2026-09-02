@@ -1311,6 +1311,23 @@ def _write_lock_holder(lock_file) -> None:
         pass
 
 
+def mine_palace_lock_path(palace_path: str) -> str:
+    """The lock file path `mine_palace_lock` uses for ``palace_path``.
+
+    Deterministic, but not pure: ``os.path.realpath`` stats the path to
+    resolve symlinks, so this touches the filesystem even though neither
+    ``palace_path`` nor ``lock_dir`` needs to exist yet for the caller to
+    compute it. Shared with read-only probes (e.g. the doctor
+    `rogue_lease_holder` check) so the key derivation — realpath + normcase
+    + sha256 — never drifts between the acquirer and a reader.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    lock_key_source = os.path.normcase(resolved)
+    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    return os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+
+
 @contextlib.contextmanager
 def mine_palace_lock(palace_path: str):
     """Per-palace non-blocking lock around the full `mine` pipeline.
@@ -1344,12 +1361,13 @@ def mine_palace_lock(palace_path: str):
     lets the threaded MCP HTTP transport write from a worker thread while the
     long-lived writer-lease is held on another thread of the same process.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
     resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
-    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    lock_path = mine_palace_lock_path(palace_path)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    # Derived from the lock filename (not recomputed independently) so this
+    # process-local re-entrancy key can never drift from the on-disk lock
+    # `mine_palace_lock_path` just produced.
+    palace_key = os.path.basename(lock_path)[len("mine_palace_") : -len(".lock")]
 
     if _held_by_this_process(palace_key):
         # This process already holds the lock for this palace — pass through.
