@@ -133,7 +133,16 @@ index state between calls.
   not immediately take over: for `MEMPALACE_HUB_GRACE_SECS` (default 60,
   config `hub.grace_secs`) a mutating call returns a retryable
   "hub restarting — retry" error instead of writing directly, so a hub that is
-  restarting comes back to a free lease. Reads fall back locally at once.
+  restarting comes back to a free lease. Reads fall back locally at once, and
+  so do the six logstream tools (`event_append`, `event_ack`, `task_create`,
+  `event_cursor_set`, `artifact_put`, `patch_submit`): they write only
+  `logstream.sqlite3`, take no palace lease, and a restarting hub has nothing
+  to lose by letting them through — stalling them would take agent
+  coordination down for the whole window. `codex_capture` mutates the palace
+  and stays held.
+- Both `-32001` conditions carry a `condition` field in `error.data`:
+  `peer_writer_active` for a peer holding the lease, `hub_restarting` for the
+  grace-window hold. Both are retryable.
 - Read-only MCP HTTP may coexist with the writer.
 - Read-only `sqlite_exact` clients use an immutable connection for a clean
   checkpointed database, or `mode=ro` when an active writer's complete WAL

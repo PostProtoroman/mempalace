@@ -767,7 +767,16 @@ def _release_mcp_writer_lock() -> None:
         # repeatedly without exiting the same context manager twice.
         _MCP_WRITER_LOCK_CM = None
         _MCP_WRITER_READ_ONLY = False
-        lock_cm.__exit__(None, None, None)
+        try:
+            lock_cm.__exit__(None, None, None)
+        except BaseException:
+            # __exit__ did not complete, so the OS may still hold the flock on
+            # our behalf. Put the handle back rather than believing we own
+            # nothing: a later release retries the same context manager, and
+            # the next _acquire_mcp_writer_lock short-circuits on it instead of
+            # opening a second fd that would contend with our own lock.
+            _MCP_WRITER_LOCK_CM = lock_cm
+            raise
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
@@ -958,14 +967,18 @@ def _start_writer_lease_retry_thread() -> None:
     threading.Thread(target=_retry, name="mcp-lease-retry", daemon=True).start()
 
 
-def _mcp_peer_writer_refusal(req_id, tool_name: str):
-    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
-        return None
+class _WriterLeaseLost(Exception):
+    """The writer lease was gone when the scoped lease re-asserted it.
 
-    ok, reason = _acquire_mcp_writer_lock()
-    if ok:
-        return None
+    Raised from ``_mcp_scoped_writer_lease`` when preflight acquired the flock
+    but a concurrent call's release handed it to a peer before this call's
+    handler ran. ``handle_request`` turns it into the ordinary retryable
+    peer-writer refusal — the honest answer, and the same one preflight would
+    have produced a moment earlier.
+    """
 
+
+def _peer_writer_refusal_payload(req_id, tool_name: str, reason: str) -> dict:
     return {
         "jsonrpc": "2.0",
         "id": req_id,
@@ -977,6 +990,9 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
                 "palace": _config.palace_path,
                 "reason": reason,
                 "retryable": True,
+                # -32001 also carries the hub-restart hold. `condition`
+                # discriminates the two without a client having to parse prose.
+                "condition": "peer_writer_active",
                 **_writer_mode(),
                 "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
             },
@@ -984,24 +1000,47 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     }
 
 
+def _mcp_peer_writer_refusal(req_id, tool_name: str):
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
+        return None
+
+    ok, reason = _acquire_mcp_writer_lock()
+    if ok:
+        return None
+
+    return _peer_writer_refusal_payload(req_id, tool_name, reason)
+
+
 @contextlib.contextmanager
 def _mcp_scoped_writer_lease(tool_name: str):
     """Bound this process's writer lease to one mutating tool call.
 
-    The lease is *acquired* by ``_mcp_peer_writer_refusal`` during preflight
-    (that is where a refusal has to be produced). This context manager owns
-    the other half: under ``per_call`` scope it releases the flock — and the
-    writable storage handles taken under it — as soon as the handler returns,
-    success or exception.
+    ``_mcp_peer_writer_refusal`` acquires the flock during preflight (that is
+    where a refusal has to be produced), but preflight runs *outside* this
+    context manager's critical section, so an acquisition made there is not by
+    itself proof the lease is still held when the handler runs. This context
+    manager owns the rest: under ``per_call`` scope it releases the flock — and
+    the writable storage handles taken under it — as soon as the handler
+    returns, success or exception.
 
-    Nested/concurrent mutating calls in one process are counted, so an inner
-    call (or a second worker thread in an embedded host) cannot release the
-    flock while an outer call is still writing; ``mine_palace_lock`` itself
-    stays re-entrant, so a ``mine`` inside a tool is unaffected.
+    Concurrent mutating calls in one process are depth-counted, and the 0->1
+    transition RE-ASSERTS ``_acquire_mcp_writer_lock()`` inside
+    ``_MCP_WRITER_LEASE_GUARD``, with the release performed under the same
+    guard. That pairing is what makes the count meaningful: without it, two
+    threads could interleave as "T2 preflight sees the flock held by T1 ->
+    T1's scope exits and releases -> T2's handler writes with no lease at
+    all", which is exactly the window a peer used to steal the palace
+    mid-write. Depth > 0 now means the flock is held for every caller counted
+    in it, so an inner call (or a second worker thread in an embedded host)
+    cannot release it out from under an outer call. ``mine_palace_lock``
+    itself stays re-entrant, so a ``mine`` inside a tool is unaffected.
 
-    ``lifetime`` scope (the writable HTTP hub) is a deliberate no-op: the hub
-    is the designated writer, keeps its storage handles hot, and must not
-    hand the palace to a racing session server between requests.
+    If the re-assert loses the flock to a live peer, the call raises
+    ``_WriterLeaseLost`` rather than writing unprotected.
+
+    ``lifetime`` scope (the writable HTTP hub) is a deliberate no-op on
+    release: the hub is the designated writer, keeps its storage handles hot,
+    and must not hand the palace to a racing session server between requests.
     """
 
     global _MCP_WRITER_LEASE_DEPTH
@@ -1012,6 +1051,11 @@ def _mcp_scoped_writer_lease(tool_name: str):
 
     with _MCP_WRITER_LEASE_GUARD:
         _MCP_WRITER_LEASE_DEPTH += 1
+        ok, reason = _acquire_mcp_writer_lock()
+        if not ok:
+            _MCP_WRITER_LEASE_DEPTH -= 1
+    if not ok:
+        raise _WriterLeaseLost(reason)
     try:
         yield
     finally:
@@ -1020,13 +1064,16 @@ def _mcp_scoped_writer_lease(tool_name: str):
             release = _MCP_WRITER_LEASE_DEPTH <= 0 and (
                 _writer_lease_scope() == _LEASE_SCOPE_PER_CALL
             )
-        if release:
-            try:
-                _release_mcp_writer_lock()
-            except Exception:
-                # A failed release must not replace the tool's own result or
-                # error. The OS still frees the flock when this process dies.
-                logger.warning("Failed to release per-call palace writer lease", exc_info=True)
+            # Released while still holding the guard: a release that landed
+            # between another thread's increment and its re-assert would put
+            # that thread back in the unprotected window this pairing closes.
+            if release:
+                try:
+                    _release_mcp_writer_lock()
+                except Exception:
+                    # A failed release must not replace the tool's own result
+                    # or error. The OS still frees the flock on process death.
+                    logger.warning("Failed to release per-call palace writer lease", exc_info=True)
 
 
 def _startup_integrity_size_limit_bytes() -> int:
@@ -7273,8 +7320,8 @@ def handle_request(request):
                 tool_args["entry"] = content_val
         try:
             # The writer lease was acquired in preflight; this scopes it to the
-            # call under per_call scope (stdio/embedded) and leaves the hub's
-            # lifetime hold alone.
+            # call under per_call scope (stdio/embedded), re-asserting ownership
+            # under the lease guard, and leaves the hub's lifetime hold alone.
             with _mcp_scoped_writer_lease(tool_name), _write_stall_watch(tool_name):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
@@ -7289,6 +7336,11 @@ def handle_request(request):
                     ]
                 },
             }
+        except _WriterLeaseLost as exc:
+            # Preflight held the lease; a concurrent call's release handed it to
+            # a peer before this handler ran. Refuse rather than write
+            # unprotected — same retryable answer preflight would have given.
+            return _peer_writer_refusal_payload(req_id, tool_name, str(exc))
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
             # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
@@ -8918,6 +8970,17 @@ _hub_last_seen_monotonic = None
 # hub is present. The window is measured from here, not from last-seen, so an
 # idle session that forwarded an hour ago still protects a hub restarting now.
 _hub_unavailable_since = None
+# The two above are read-modify-written from whichever thread handles a
+# request. stdio's loop is single-threaded, but these are module globals in a
+# module that also runs a ThreadingHTTPServer, so the transitions take a guard
+# and readers take a consistent snapshot of the pair.
+_HUB_STATE_GUARD = threading.Lock()
+
+
+def _hub_state_snapshot() -> tuple:
+    """(_hub_last_seen_monotonic, _hub_unavailable_since) read as one pair."""
+    with _HUB_STATE_GUARD:
+        return _hub_last_seen_monotonic, _hub_unavailable_since
 
 
 def _hub_grace_window_secs() -> float:
@@ -8926,34 +8989,42 @@ def _hub_grace_window_secs() -> float:
     ``MEMPALACE_HUB_GRACE_SECS`` first, then ``hub.grace_secs`` in
     config.json, then 60. Clamped to 0..3600; 0 disables the window (immediate
     direct fallback, the pre-#2214 behaviour).
+
+    An unparseable value at one level falls through to the next, so a typo in
+    the environment still honours a configured ``hub.grace_secs`` rather than
+    silently reverting to the hard default.
     """
-    raw = os.environ.get(_HUB_GRACE_SECS_ENV, "").strip()
-    if not raw:
+
+    def _parse(raw: str, source: str):
+        raw = (raw or "").strip()
+        if not raw:
+            return None
         try:
-            configured = getattr(_config, "hub_grace_secs", None)
-        except Exception:
-            configured = None
-        raw = "" if configured is None else str(configured).strip()
-    if not raw:
-        return _HUB_GRACE_SECS_DEFAULT
+            secs = float(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; ignoring it", source, raw)
+            return None
+        return min(_HUB_GRACE_SECS_MAX, max(0.0, secs))
+
+    from_env = _parse(os.environ.get(_HUB_GRACE_SECS_ENV, ""), _HUB_GRACE_SECS_ENV)
+    if from_env is not None:
+        return from_env
     try:
-        secs = float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using default %.0fs",
-            _HUB_GRACE_SECS_ENV,
-            raw,
-            _HUB_GRACE_SECS_DEFAULT,
-        )
-        return _HUB_GRACE_SECS_DEFAULT
-    return min(_HUB_GRACE_SECS_MAX, max(0.0, secs))
+        configured = getattr(_config, "hub_grace_secs", None)
+    except Exception:
+        configured = None
+    from_config = _parse("" if configured is None else str(configured), "hub.grace_secs")
+    if from_config is not None:
+        return from_config
+    return _HUB_GRACE_SECS_DEFAULT
 
 
 def _note_hub_seen() -> None:
     """Record proof that a hub answered: a forward completed, or it returned HTTP."""
     global _hub_last_seen_monotonic, _hub_unavailable_since
-    _hub_last_seen_monotonic = time.monotonic()
-    _hub_unavailable_since = None
+    with _HUB_STATE_GUARD:
+        _hub_last_seen_monotonic = time.monotonic()
+        _hub_unavailable_since = None
 
 
 def _note_hub_record() -> None:
@@ -8966,27 +9037,30 @@ def _note_hub_record() -> None:
     the window could never expire.
     """
     global _hub_last_seen_monotonic
-    if _hub_last_seen_monotonic is None:
-        _hub_last_seen_monotonic = time.monotonic()
+    with _HUB_STATE_GUARD:
+        if _hub_last_seen_monotonic is None:
+            _hub_last_seen_monotonic = time.monotonic()
 
 
 def _note_hub_missing() -> None:
     """Record the start of an outage, but only for a hub we have actually seen."""
     global _hub_unavailable_since
-    if _hub_last_seen_monotonic is None:
-        return
-    if _hub_unavailable_since is None:
-        _hub_unavailable_since = time.monotonic()
+    with _HUB_STATE_GUARD:
+        if _hub_last_seen_monotonic is None:
+            return
+        if _hub_unavailable_since is None:
+            _hub_unavailable_since = time.monotonic()
 
 
 def _hub_grace_active() -> bool:
     """True while a previously-seen hub has been missing for less than the window."""
-    if _hub_last_seen_monotonic is None or _hub_unavailable_since is None:
+    last_seen, unavailable_since = _hub_state_snapshot()
+    if last_seen is None or unavailable_since is None:
         return False
     window = _hub_grace_window_secs()
     if window <= 0:
         return False
-    return (time.monotonic() - _hub_unavailable_since) < window
+    return (time.monotonic() - unavailable_since) < window
 
 
 def _hub_restarting_error(request: dict):
@@ -8995,8 +9069,9 @@ def _hub_restarting_error(request: dict):
         return None
     window = _hub_grace_window_secs()
     waited = 0.0
-    if _hub_unavailable_since is not None:
-        waited = max(0.0, time.monotonic() - _hub_unavailable_since)
+    _, unavailable_since = _hub_state_snapshot()
+    if unavailable_since is not None:
+        waited = max(0.0, time.monotonic() - unavailable_since)
     return {
         "jsonrpc": "2.0",
         "id": request.get("id"),
@@ -9007,6 +9082,9 @@ def _hub_restarting_error(request: dict):
                 "tool": ((request.get("params") or {}).get("name")) or "",
                 "palace": getattr(_config, "palace_path", ""),
                 "retryable": True,
+                # -32001 also carries the peer-writer refusal. `condition`
+                # discriminates the two without a client having to parse prose.
+                "condition": "hub_restarting",
                 "reason": (
                     "The palace hub that owns this palace is not answering "
                     "right now (restart in progress). This mutating call is "
@@ -9079,6 +9157,26 @@ def _request_is_mutating(request: dict) -> bool:
     return name in _MUTATING_TOOLS
 
 
+def _request_takes_palace_lease(request: dict) -> bool:
+    """True for a call whose direct write would take the palace writer lease.
+
+    Narrower than :func:`_request_is_mutating` on purpose. The grace window
+    exists to stop a direct write from stranding the flock a returning hub
+    needs, so only calls that actually take the flock have anything to gain by
+    waiting. The six ``_PEER_WRITER_EXEMPT_TOOLS`` write logstream.sqlite3 —
+    an independent WAL database, no palace lease, no Chroma state — and were
+    exempted precisely so agent coordination survives a peer holding the
+    palace. Holding them here would stall the coordination channel for the
+    whole window on every hub restart, which is the escalation path this lane
+    exists to close. ``mempalace_codex_capture`` mutates the palace and stays
+    held.
+    """
+    if not _request_is_mutating(request):
+        return False
+    name = ((request.get("params") or {}).get("name")) or ""
+    return name not in _PEER_WRITER_EXEMPT_TOOLS
+
+
 def _dispatch_stdio_request(request: dict):
     """Route one stdio request: live hub first, local handling otherwise.
 
@@ -9090,9 +9188,10 @@ def _dispatch_stdio_request(request: dict):
     hub may still be executing it), so it surfaces as a JSON-RPC error.
 
     A hub that has *vanished* (no serverinfo record) is the restart case, not
-    the mid-flight case: within the grace window a mutating call gets a
-    retryable "hub restarting" error rather than a direct write that would
-    strand the returning hub. Reads fall back locally either way.
+    the mid-flight case: within the grace window a palace-lease-taking call
+    gets a retryable "hub restarting" error rather than a direct write that
+    would strand the returning hub. Reads fall back locally either way, and so
+    do the logstream tools — see :func:`_request_takes_palace_lease`.
     """
     import urllib.error
 
@@ -9100,8 +9199,12 @@ def _dispatch_stdio_request(request: dict):
     if target is None:
         # The kill switch means "never route through a hub", so it must not be
         # able to stall a write waiting for one either.
+        # A notification (no id) has nowhere to receive a retryable error, so
+        # holding it would silently drop the write. Write it directly instead:
+        # one stranded lease is recoverable, a lost write is not.
         if (
-            _request_is_mutating(request)
+            _request_takes_palace_lease(request)
+            and request.get("id") is not None
             and not _truthy_env_off(_HUB_FORWARD_ENV)
             and _hub_grace_active()
         ):

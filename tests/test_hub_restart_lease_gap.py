@@ -39,6 +39,10 @@ from mempalace import mcp_server
 
 MUTATING_TOOL = "mempalace_add_drawer"
 
+# Captured before any fixture stubs it, so one test can exercise the real
+# handle-closing that per-call release depends on.
+_REAL_DISCARD_HANDLES = mcp_server._discard_mcp_storage_handles
+
 
 @pytest.fixture
 def lease_env(monkeypatch, tmp_path):
@@ -568,6 +572,46 @@ class TestHubGraceWindow:
         )
         assert mcp_server._hub_grace_window_secs() == 7.0
 
+    def test_invalid_env_still_honours_configured_grace(self, monkeypatch, lease_env):
+        """A typo in the env must not silently discard hub.grace_secs."""
+        monkeypatch.setenv(mcp_server._HUB_GRACE_SECS_ENV, "nonsense")
+        monkeypatch.setattr(
+            mcp_server,
+            "_config",
+            SimpleNamespace(palace_path=lease_env, hub_grace_secs=7.0),
+            raising=False,
+        )
+        assert mcp_server._hub_grace_window_secs() == 7.0
+
+    def test_hub_restart_error_is_distinguishable_from_a_peer_writer_refusal(
+        self, monkeypatch, hub_state
+    ):
+        """Both conditions ride -32001; ``condition`` tells them apart."""
+        monkeypatch.setattr(mcp_server, "_hub_unavailable_since", time.monotonic())
+        hub = mcp_server._hub_restarting_error(_call())
+        peer = mcp_server._peer_writer_refusal_payload(1, MUTATING_TOOL, "peer holds it")
+        assert hub["error"]["code"] == peer["error"]["code"] == -32001
+        assert hub["error"]["data"]["condition"] == "hub_restarting"
+        assert peer["error"]["data"]["condition"] == "peer_writer_active"
+
+    def test_mutating_notification_is_written_rather_than_dropped(self, monkeypatch, hub_state):
+        """A notification has nowhere to receive a retryable error.
+
+        Holding one means the write vanishes with no diagnostic. One stranded
+        lease is recoverable; a lost write is not.
+        """
+        monkeypatch.setattr(mcp_server, "_hub_last_seen_monotonic", time.monotonic())
+        monkeypatch.setattr(mcp_server, "_hub_unavailable_since", time.monotonic())
+        handled = []
+        monkeypatch.setattr(
+            mcp_server, "handle_request", lambda request: handled.append(request) or None
+        )
+
+        notification = _call()
+        notification.pop("id")
+        assert mcp_server._dispatch_stdio_request(notification) is None
+        assert len(handled) == 1
+
     def test_zero_window_disables_the_hold(self, monkeypatch, hub_state):
         monkeypatch.setenv(mcp_server._HUB_GRACE_SECS_ENV, "0")
         monkeypatch.setattr(mcp_server, "_hub_last_seen_monotonic", time.monotonic())
@@ -578,6 +622,87 @@ class TestHubGraceWindow:
         )
         assert mcp_server._dispatch_stdio_request(_call()) == {"ok": True}
         assert len(handled) == 1
+
+
+class TestLogstreamToolsSurviveTheGraceWindow:
+    """The six logstream tools must not be stalled by a hub restart.
+
+    They write only logstream.sqlite3 — an independent WAL database — take no
+    palace lease, and were exempted from peer-writer refusal precisely so
+    agent coordination survives a peer holding the palace. Holding them for
+    the grace window would fail every coordination write for up to a minute on
+    each hub restart, which is the escalation path this lane exists to close.
+    """
+
+    @pytest.mark.parametrize("tool", sorted(mcp_server._PEER_WRITER_EXEMPT_TOOLS))
+    def test_exempt_tool_writes_through_a_hub_outage(self, monkeypatch, hub_state, tool):
+        monkeypatch.setattr(mcp_server, "_hub_last_seen_monotonic", time.monotonic())
+        monkeypatch.setattr(mcp_server, "_hub_unavailable_since", time.monotonic())
+        handled = []
+        monkeypatch.setattr(
+            mcp_server, "handle_request", lambda request: handled.append(request) or {"ok": True}
+        )
+
+        assert mcp_server._hub_grace_active() is True
+        assert mcp_server._dispatch_stdio_request(_call(tool_name=tool)) == {"ok": True}
+        assert len(handled) == 1, f"{tool} was held by the grace window"
+
+    def test_the_exempt_set_is_exactly_the_logstream_tools(self):
+        """A palace-mutating tool must never join the pass-through by accident."""
+        assert mcp_server._PEER_WRITER_EXEMPT_TOOLS == frozenset(
+            {
+                "mempalace_event_append",
+                "mempalace_task_create",
+                "mempalace_event_ack",
+                "mempalace_event_cursor_set",
+                "mempalace_artifact_put",
+                "mempalace_patch_submit",
+            }
+        )
+        assert mcp_server._PEER_WRITER_EXEMPT_TOOLS <= mcp_server._MUTATING_TOOLS
+
+    def test_codex_capture_is_still_held(self, monkeypatch, hub_state):
+        """It mutates the palace, so a direct write would strand the flock."""
+        monkeypatch.setattr(mcp_server, "_hub_last_seen_monotonic", time.monotonic())
+        monkeypatch.setattr(mcp_server, "_hub_unavailable_since", time.monotonic())
+        monkeypatch.setattr(
+            mcp_server,
+            "handle_request",
+            lambda request: pytest.fail("codex_capture fell back to a direct write"),
+        )
+
+        response = mcp_server._dispatch_stdio_request(_call(tool_name="mempalace_codex_capture"))
+        assert response["error"]["code"] == -32001
+        assert response["error"]["data"]["condition"] == "hub_restarting"
+
+    def test_exempt_tools_are_still_never_replayed_after_a_mid_flight_failure(
+        self, monkeypatch, lease_env
+    ):
+        """Pass-through applies to the *hub-missing* case only.
+
+        A forward that died in flight may already have been executed by the
+        hub, so replaying a logstream append locally would duplicate an
+        append-only event. That guard keys off _request_is_mutating, which
+        still covers all six.
+        """
+        import urllib.error
+
+        monkeypatch.setattr(mcp_server, "_hub_last_seen_monotonic", time.monotonic())
+        monkeypatch.setattr(mcp_server, "_hub_unavailable_since", None)
+        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://h", {}))
+        monkeypatch.setattr(
+            mcp_server,
+            "handle_request",
+            lambda request: pytest.fail("a mid-flight logstream write was replayed locally"),
+        )
+
+        def boom(*args, **kwargs):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", boom)
+
+        response = mcp_server._dispatch_stdio_request(_call(tool_name="mempalace_event_append"))
+        assert response["error"]["code"] == -32000
 
 
 class TestHubSightingBookkeeping:
@@ -671,30 +796,195 @@ def test_statusz_writer_payload_names_the_lease_scope(monkeypatch, lease_env):
     assert mcp_server._writer_lease_scope() == "lifetime"
 
 
-def test_threaded_mutating_calls_do_not_release_each_others_lease(monkeypatch, lease_env):
-    """Depth counting, exercised with real threads rather than by inspection."""
-    started = threading.Barrier(2)
-    inner_done = threading.Event()
-    seen = []
+def test_concurrent_calls_never_leave_a_handler_writing_without_the_lease(monkeypatch, lease_env):
+    """Two real ``handle_request`` calls; no peer may take the palace mid-write.
 
-    def worker(hold_until):
-        with mcp_server._mcp_scoped_writer_lease(MUTATING_TOOL):
-            started.wait(timeout=5)
-            hold_until.wait(timeout=5)
-            seen.append(mcp_server._MCP_WRITER_LOCK_CM is not None)
+    The regression pinned here: the flock is acquired in *preflight*, but the
+    depth counter used to be incremented later, inside the scoped lease. Two
+    concurrent mutating calls could interleave as "T2's preflight sees the
+    lease already held by T1 -> T1's scope exits and releases it -> T2's
+    handler runs with nothing held", and an outside process could then take
+    the palace while T2 was mid-write.
+
+    The predecessor of this test pre-acquired the lease and drove
+    ``_mcp_scoped_writer_lease`` directly, which exercises the context manager
+    in isolation and structurally cannot see that interleaving. This one goes
+    through the real entry point and asserts the property that matters: while
+    ANY handler body is executing, a peer's ``mine_palace_lock`` must fail.
+    The gap *between* the two calls is not asserted — giving the flock back
+    between calls is exactly what per-call scoping is for.
+    """
+    from mempalace import palace as palace_mod
+
+    # Contend like a peer: without this, a second open in this process takes
+    # the re-entrancy passthrough instead of conflicting on the flock.
+    monkeypatch.setattr(palace_mod, "_held_by_this_process", lambda key: False)
+
+    in_flight_guard = threading.Lock()
+    state = {"in_flight": 0}
+    thefts = []
+    lease_seen = {}
+    responses = {}
+    t2_preflight_done = threading.Event()
+    t1_finished = threading.Event()
+    stop_stealing = threading.Event()
+
+    def stealer():
+        """Try to take the palace, but only while a handler is writing."""
+        while not stop_stealing.is_set():
+            with in_flight_guard:
+                if state["in_flight"] > 0:
+                    try:
+                        cm = palace_mod.mine_palace_lock(lease_env)
+                        cm.__enter__()
+                        cm.__exit__(None, None, None)
+                        thefts.append(time.monotonic())
+                    except palace_mod.MineAlreadyRunning:
+                        pass
+            time.sleep(0.002)
+
+    def handler():
+        name = threading.current_thread().name
+        with in_flight_guard:
+            state["in_flight"] += 1
+        try:
+            lease_seen[name] = mcp_server._MCP_WRITER_LOCK_CM is not None
+            if name == "T1":
+                t2_preflight_done.wait(timeout=5)
+            # Stay inside the write long enough for the stealer to get real
+            # attempts in while this handler is on the clock.
+            time.sleep(0.05)
+        finally:
+            with in_flight_guard:
+                state["in_flight"] -= 1
+        return {"ok": True}
+
+    _install_fake_tool(monkeypatch, handler)
+
+    real_preflight = mcp_server._mcp_tool_preflight_refusal
+
+    def sequenced_preflight(req_id, tool_name):
+        out = real_preflight(req_id, tool_name)
+        if threading.current_thread().name == "T2":
+            # T2 has passed the acquire; let T1 run and fully release before
+            # T2 enters its scope. That is the interleaving under test.
+            t2_preflight_done.set()
+            t1_finished.wait(timeout=5)
+        return out
+
+    monkeypatch.setattr(mcp_server, "_mcp_tool_preflight_refusal", sequenced_preflight)
+
+    thief = threading.Thread(target=stealer, name="peer", daemon=True)
+    thief.start()
+
+    def run_t1():
+        try:
+            responses["T1"] = mcp_server.handle_request(_call(req_id=1))
+        finally:
+            t1_finished.set()
+
+    t2 = threading.Thread(
+        target=lambda: responses.__setitem__("T2", mcp_server.handle_request(_call(req_id=2))),
+        name="T2",
+    )
+    t1 = threading.Thread(target=run_t1, name="T1")
+    t2.start()
+    time.sleep(0.05)
+    t1.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+    stop_stealing.set()
+    thief.join(timeout=5)
+
+    assert not t1.is_alive() and not t2.is_alive()
+    assert thefts == [], "a peer took the palace flock while a handler was writing"
+    assert lease_seen == {"T1": True, "T2": True}, lease_seen
+    for name in ("T1", "T2"):
+        assert "result" in responses[name], responses[name]
+    assert mcp_server._MCP_WRITER_LEASE_DEPTH == 0
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+
+def test_lease_lost_between_preflight_and_handler_refuses_instead_of_writing(
+    monkeypatch, lease_env
+):
+    """The re-assert's own failure path: refuse, never write unprotected."""
+    monkeypatch.setattr(mcp_server, "_mcp_read_only_refusal", lambda req_id, tool: None)
+    monkeypatch.setattr(mcp_server, "_mcp_sqlite_integrity_refusal", lambda req_id, tool: None)
+    monkeypatch.setattr(mcp_server, "_mcp_stale_library_refusal", lambda req_id, tool: None)
+    monkeypatch.setattr(mcp_server, "_mcp_diverged_index_refusal", lambda req_id, tool: None)
+
+    calls = []
+
+    def acquire():
+        calls.append(1)
+        # Preflight wins; the scope's re-assert finds a peer holding it.
+        if len(calls) == 1:
+            return True, ""
+        return False, "another mempalace writer already holds the palace lock"
+
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", acquire)
+    _install_fake_tool(monkeypatch, lambda: pytest.fail("handler ran without the lease"))
+    # _install_fake_tool re-stubs the other gates; keep our acquire double.
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", acquire)
+
+    response = mcp_server.handle_request(_call())
+
+    assert response["error"]["code"] == -32001
+    assert response["error"]["data"]["condition"] == "peer_writer_active"
+    assert response["error"]["data"]["retryable"] is True
+    assert mcp_server._MCP_WRITER_LEASE_DEPTH == 0
+
+
+def test_release_really_closes_storage_handles(monkeypatch, lease_env):
+    """The un-stubbed release path: per-call scoping must drop writable handles.
+
+    Every other test in this file stubs ``_discard_mcp_storage_handles`` for
+    speed, so nothing exercised the behaviour the per-call lease depends on —
+    a flock handed back while a Chroma PersistentClient stayed open would
+    re-enter the stale-HNSW hazard the lease exists to prevent.
+    """
+    # Put the real implementation back over the fixture's stub.
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", _REAL_DISCARD_HANDLES)
+    monkeypatch.setattr(mcp_server, "_client_cache", object())
+    monkeypatch.setattr(mcp_server, "_collection_cache", object())
 
     assert mcp_server._acquire_mcp_writer_lock() == (True, "")
-    slow = threading.Thread(target=worker, args=(inner_done,))
-    slow.start()
+    # Acquisition itself drops any query-only handle taken before promotion.
+    assert mcp_server._client_cache is None
+    mcp_server._client_cache = object()
+    mcp_server._collection_cache = object()
+
     with mcp_server._mcp_scoped_writer_lease(MUTATING_TOOL):
-        started.wait(timeout=5)
-    # The fast scope exited while the slow one is still inside: the lease must
-    # still be held.
-    assert mcp_server._MCP_WRITER_LOCK_CM is not None
-    inner_done.set()
-    slow.join(timeout=5)
-    assert seen == [True]
+        pass
+
     assert mcp_server._MCP_WRITER_LOCK_CM is None
+    assert mcp_server._client_cache is None
+    assert mcp_server._collection_cache is None
+
+
+def test_failed_release_keeps_the_handle_rather_than_believing_it_is_free(monkeypatch, lease_env):
+    """If ``__exit__`` raises, the OS may still hold the flock — say so."""
+
+    class Boom:
+        def __exit__(self, *exc):
+            raise RuntimeError("close failed")
+
+    boom = Boom()
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", boom)
+
+    with pytest.raises(RuntimeError):
+        mcp_server._release_mcp_writer_lock()
+
+    assert mcp_server._MCP_WRITER_LOCK_CM is boom
+    # The scoped lease swallows it so a tool result is never replaced by a
+    # release failure, and the handle survives for a later retry.
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LEASE_DEPTH", 0)
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", lambda: (True, ""))
+    with mcp_server._mcp_scoped_writer_lease(MUTATING_TOOL):
+        pass
+    assert mcp_server._MCP_WRITER_LOCK_CM is boom
+    mcp_server._MCP_WRITER_LOCK_CM = None
 
 
 def test_json_serializable_hub_error(monkeypatch, lease_env):
