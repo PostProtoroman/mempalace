@@ -2116,7 +2116,11 @@ def cmd_doctor(args):
     exit_code = doctor.overall_exit_code(results)
 
     if getattr(args, "json", False):
-        print(_json.dumps({"results": [r.to_dict() for r in results], "exit_code": exit_code}, indent=2))
+        print(
+            _json.dumps(
+                {"results": [r.to_dict() for r in results], "exit_code": exit_code}, indent=2
+            )
+        )
     else:
         print("\n  mempalace doctor\n")
         print(doctor.format_table(results))
@@ -4433,8 +4437,12 @@ def main():
         help="Number of drawers to sample for the secrets check (default: 5000)",
     )
     p_doctor.add_argument("--sessions-root", default=None, help="Override Codex sessions root")
-    p_doctor.add_argument("--backup-dest", default=None, help="Override backup destination directory")
-    p_doctor.add_argument("--home", default=None, help="Override home directory (for launchd/service checks)")
+    p_doctor.add_argument(
+        "--backup-dest", default=None, help="Override backup destination directory"
+    )
+    p_doctor.add_argument(
+        "--home", default=None, help="Override home directory (for launchd/service checks)"
+    )
 
     p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
     update_sub = p_update.add_subparsers(dest="update_action")
