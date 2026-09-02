@@ -18,7 +18,7 @@ This applies to every routine write initiated by the Python hook layer:
 - project auto-ingest;
 - SessionEnd final flushes;
 - PreCompact transcript ingest;
-- PreCompact synchronous project mining.
+- PreCompact project mining (submitted, not awaited — see below).
 
 It does not change CLI write routing. CLI adoption is a separate follow-up.
 
@@ -48,6 +48,30 @@ If the daemon is unavailable:
 - the hook log records the skipped operation;
 - the hook returns a visible `systemMessage`;
 - the Stop save marker is not advanced, allowing a later retry.
+
+## Hooks submit mines; they do not wait for them
+
+Every hook mine path — Stop/SessionEnd auto-ingest and PreCompact alike —
+returns once the mine has been *submitted*: queued on the hub's background
+worker, queued on the daemon, or started as a detached subprocess. None of
+them waits for it to finish.
+
+PreCompact used to be the exception: it ran `mempalace mine` with a 60-second
+`subprocess.run` timeout and blocked. Against a live HTTP hub that request was
+the one the hub ran inline inside its exclusive write path, where a 20-80 MB
+transcript took minutes and the write-stall watchdog
+(`MEMPALACE_MCP_WRITE_STALL_EXIT_SECS`) killed the hub as if the write were
+wedged. The hub now enqueues the mine and answers immediately with a job id;
+the worker takes the palace write lock one source file at a time.
+
+Nothing is lost by not waiting: mining is idempotent (deterministic drawer ids
+upsert to the same rows), so a mine still running when compaction happens keeps
+filing the same content. The old behavior's 60-second kill was strictly worse —
+it stopped the mine partway with no retry.
+
+Follow a queued hub job in `mempalace_status.mine_queue` or the hub's
+`/statusz`; each completed job also appends a line to `mine_jobs.jsonl` in the
+palace directory.
 
 ## Why hooks do not start the daemon
 

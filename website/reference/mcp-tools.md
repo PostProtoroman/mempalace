@@ -166,7 +166,11 @@ Machine sessions are guarded: a session whose `thread_source` is `subagent` or `
 
 ### `mempalace_mine`
 
-Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses.
+
+On a shared HTTP hub the mine is queued as a background job and the call returns immediately with `{queued: true, job_id, state, position}`; the worker drains jobs one at a time and takes the palace write lock per source file, so a long mine never blocks other agents' writes for more than one file. A repeat request for the same `(source, mode, wing)` returns the job already queued rather than stacking a second one. Follow progress in `mempalace_status.mine_queue` or the hub's `/statusz`; each completed job appends a line to `mine_jobs.jsonl` in the palace directory.
+
+Everywhere else — stdio, embedded, read-only servers, and any hub started with `MEMPALACE_MCP_MINE_ASYNC=0` — it runs synchronously and returns the miner's summary as `output`. Pass `wait=true` for that contract on the hub too. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -177,6 +181,8 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `wait` | boolean | No | On a hub, block until the queued job finishes and return the miner's summary (default false) |
+| `wait_timeout` | number | No | Seconds to wait when `wait=true` (default `MEMPALACE_MCP_MINE_WAIT_SECS`, 600). On timeout the job keeps running and its `job_id` is returned |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
 
