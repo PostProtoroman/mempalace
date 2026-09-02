@@ -779,8 +779,8 @@ def _lock_deferral_reason(job: dict) -> str:
     return f"{reason} (job {job.get('id')} stays queued and runs when the holder exits)"
 
 
-def _maybe_auto_ingest():
-    """Background-mine MEMPAL_DIR (project files) if set.
+def _submit_mine_targets(context: str):
+    """Submit a background mine for every MEMPAL_DIR target. Never blocks.
 
     Transcript convos are ingested separately via ``_ingest_transcript``
     in the hook handlers — this function does not handle them, to avoid
@@ -790,7 +790,11 @@ def _maybe_auto_ingest():
     Per-target dedup is done by ``_spawn_mine`` itself: each (dir, mode)
     target gets its own PID slot, so distinct targets never block each
     other but a re-fire of the same target while the previous one is
-    still running is silently skipped.
+    still running is silently skipped. When a writable hub is live the
+    spawned CLI forwards the mine to it and returns as soon as the hub has
+    queued the job, so this path costs a subprocess start, not a mine.
+
+    ``context`` names the caller in the hook log when routing blocks the write.
     """
     targets = _get_mine_targets()
     if not targets:
@@ -798,7 +802,7 @@ def _maybe_auto_ingest():
 
     routing = _current_hook_write_routing()
     if routing.blocked:
-        _log_hook_write_blocked(routing, "project auto-ingest")
+        _log_hook_write_blocked(routing, context)
         return
 
     for mine_dir, mode in targets:
@@ -825,74 +829,37 @@ def _maybe_auto_ingest():
             _log(f"mine hook failed: {exc}")
 
 
-def _mine_sync():
-    """Synchronously mine MEMPAL_DIR (precompact path).
+def _maybe_auto_ingest():
+    """Background-mine MEMPAL_DIR (project files) if set."""
+    _submit_mine_targets("project auto-ingest")
 
-    Transcript convos are ingested separately via ``_ingest_transcript``
-    in ``hook_precompact`` — keeping them out of this function avoids
-    timeout stacking against the harness 30s ceiling (#1231 review).
+
+def _mine_precompact():
+    """Submit the MEMPAL_DIR project mine from the PreCompact hook.
+
+    Formerly ``_mine_sync``, which ran ``mempalace mine`` with
+    ``subprocess.run(timeout=60)`` and waited. What PreCompact guarantees
+    changed, deliberately, and the name had to stop claiming otherwise:
+
+    * **Before**: the hook blocked the shell for up to 60 seconds and then
+      *killed* the mine mid-file if it had not finished. Against a live hub
+      it blocked for the whole forwarded mine — that request is what the hub
+      ran inline in its write path until its own stall watchdog killed it.
+    * **Now**: PreCompact guarantees the mine is *submitted* before
+      compaction proceeds — queued on the hub's worker, queued on the daemon,
+      or started as a detached subprocess — not that it has completed. The
+      shell is released immediately.
+
+    Nothing is lost by not waiting. Mining is idempotent (deterministic
+    drawer ids upsert to the same rows) and per-source-file, so a mine that
+    is still running when compaction happens keeps filing the same content;
+    the previous behavior's 60-second kill was strictly worse, since it
+    stopped the mine partway with no retry.
+
+    Transcript convos are ingested separately via ``_ingest_transcript`` in
+    ``hook_precompact``, so they are not among these targets.
     """
-    targets = _get_mine_targets()
-    if not targets:
-        return
-
-    routing = _current_hook_write_routing()
-    if routing.blocked:
-        _log_hook_write_blocked(routing, "synchronous project mine")
-        return
-
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = STATE_DIR / "hook.log"
-    for mine_dir, mode in targets:
-        try:
-            if routing.use_daemon:
-                try:
-                    job = _submit_daemon_job(
-                        "mine",
-                        {"source": mine_dir, "mode": mode, "agent": "mempalace"},
-                        dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
-                        wait=True,
-                        timeout=60,
-                    )
-                    result = job.get("result") or {}
-                    if _job_deferred_by_lock(job):
-                        # Parked behind the palace lock, not failed: the daemon
-                        # runs it once the holder exits. Saying "failed" here
-                        # would be the false report #2014 is about.
-                        _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
-                    elif job.get("state") != "succeeded" or not result.get("success", True):
-                        _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
-                except Exception as exc:
-                    # Daemon accepted context — don't fall back (would double-mine).
-                    _log(f"Daemon sync mine submission failed: {exc}")
-                continue
-            with open(log_path, "a") as log_f:
-                subprocess.run(
-                    [
-                        _mempalace_python(),
-                        "-m",
-                        "mempalace",
-                        "mine",
-                        mine_dir,
-                        "--mode",
-                        mode,
-                    ],
-                    stdout=log_f,
-                    stderr=log_f,
-                    timeout=60,
-                    # Windows: hide the conhost window this sync mine would
-                    # otherwise flash on every fire. Mirrors the async paths
-                    # (_spawn_mine / _desktop_toast) via _detached_popen_kwargs().
-                    # 0 is a no-op off-Windows.
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        except Exception as exc:
-            # Non-daemon sync spawn path failed. Hooks must never crash the
-            # user's shell — log and continue (not a daemon failure; the daemon
-            # block above handles its own errors).
-            _log(f"mine hook failed: {exc}")
+    _submit_mine_targets("precompact project mine")
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):
@@ -1903,10 +1870,11 @@ def hook_precompact(data: dict, harness: str):
                     agent_name=_diary_agent_for_harness(harness),
                 )
 
-        # Mine MEMPAL_DIR synchronously so project data lands before
-        # compaction proceeds. Transcript convos were already kicked off
-        # above via _ingest_transcript.
-        _mine_sync()
+        # Submit the MEMPAL_DIR project mine before compaction proceeds.
+        # Submitted, not completed — see _mine_precompact for what changed
+        # and why waiting was worse than not waiting. Transcript convos were
+        # already kicked off above via _ingest_transcript.
+        _mine_precompact()
 
     _output({})
 

@@ -941,6 +941,25 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
         print("mempalace: hub returned an unrecognized mine response", file=sys.stderr)
         sys.exit(1)
 
+    # Since the hub runs mines on a background worker (one source file per
+    # lock hold), an accepted mine answers with a job id instead of the
+    # miner's summary. That is a success: the job is durable for as long as
+    # the hub lives, and the alternative — the CLI blocking for the three
+    # minutes an 80 MB transcript takes — is what made every Stop hook stall
+    # and the hub's own stall watchdog kill it.
+    # ``success`` is checked here and not only below because the hub has one
+    # reply that is queued *and* unsuccessful: the wait=true timeout payload
+    # carries the job id alongside success=False. The CLI never asks for
+    # wait=true, but reporting "queued" for a reply that says it failed would
+    # be the wrong way round if it ever did.
+    if result.get("queued") and result.get("success", True):
+        note = " (already queued)" if result.get("deduplicated") else ""
+        position = result.get("position")
+        where = f", position {position}" if position else ""
+        print(f"mempalace: hub queued mine as {result.get('job_id')}{note}{where}")
+        print("mempalace: follow it with `mempalace status` or the hub's /statusz")
+        return True
+
     output = result.get("output")
     if output:
         print(output)
