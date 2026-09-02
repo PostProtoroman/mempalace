@@ -11,8 +11,10 @@ launchd drift on other platforms) with the exception text as the reason.
 
 Checks never touch live state. They only read: sampled drawer documents,
 heartbeat files, launchd plists (read-only — never load/unload), backup
-archive directory listings, HNSW/sqlite counts, and legacy KG files opened
-read-only via ``migrate_knowledge_graph(..., apply=False)``.
+archive directory listings, HNSW/sqlite counts, legacy KG files opened
+read-only via ``migrate_knowledge_graph(..., apply=False)``, a read-only
+``launchctl print`` of the hub job, and a non-blocking probe of the palace
+writer lease's flock (acquired and immediately released — never held).
 """
 
 from __future__ import annotations
@@ -573,12 +575,16 @@ def _read_mine_lock_state(palace_path: str) -> dict:
     long it has been held (the holder truncates+writes+flushes that region
     right after acquiring, so mtime tracks the most recent acquire).
 
-    POSIX only (``fcntl.flock``) — callers must gate on macOS themselves;
-    this is never reached on Windows since the check that calls it skips
-    off-Darwin before probing.
+    POSIX only (``fcntl.flock``). The caller (``check_rogue_lease_holder``)
+    already skips off-Darwin before reaching this function, but that guard
+    is on ``platform.system()`` — mockable, and mocked by tests that force
+    the Darwin path to run cross-platform. This function therefore carries
+    its own, unmockable gate on ``os.name`` and never imports ``fcntl``
+    (which does not exist on Windows) unless that gate has passed: on any
+    non-POSIX platform it returns immediately with ``skipped`` set, and
+    ``fcntl`` is imported lazily, after that check, only on the path that
+    actually needs it.
     """
-    import fcntl
-
     from .palace import _LOCK_SENTINEL_BYTES, _format_lock_holder, mine_palace_lock_path
 
     lock_path = mine_palace_lock_path(palace_path)
@@ -590,10 +596,19 @@ def _read_mine_lock_state(palace_path: str) -> dict:
         "holder_label": None,
         "lock_path": lock_path,
     }
+    if os.name != "posix":
+        return dict(free, skipped=True)
     if not os.path.exists(lock_path):
         return free
 
-    lf = open(lock_path, "rb")
+    import fcntl
+
+    try:
+        lf = open(lock_path, "rb")
+    except FileNotFoundError:
+        # Removed between the exists() check above and this open -- that's
+        # still the "lease is free" case, not a failure.
+        return free
     try:
         lf.seek(0)
         try:
@@ -681,14 +696,26 @@ def check_rogue_lease_holder(palace_path: str, home: "str | None" = None) -> Che
     through it. If a hub restart races a session's own stdio MCP server for
     the non-blocking flock, that session's process can win and keep the
     lease past the restart, silently starving the hub of writes until that
-    session's server exits. This check surfaces exactly that scenario
-    without ever acquiring the lock itself.
+    session's server exits. This check surfaces exactly that scenario —
+    though not without touching the lock at all: it takes a non-blocking
+    probe (acquire, immediately release) to tell "free" from "held", same as
+    ``mine_palace_lock`` itself would. A `mempalace doctor` run that lands in
+    the same microsecond as a hook-spawned ``mine``'s own non-blocking
+    acquire can make that ``mine`` lose the race and drop its work
+    (``MineAlreadyRunning``) — a window inherent to flock, not specific to
+    this probe, but worth knowing before running doctor from a hot path.
 
     A holder is identified as the hub two ways: its recorded command line
     contains ``--transport http`` (the hub's own exec'd argv), or its PID
     matches the ``ai.mempalace.hub`` launchd job's PID. Either is enough,
     since the recorded command line is best-effort (only ``sys.argv[:3]``)
-    and the launchd PID lookup can fail (job not loaded, no launchctl).
+    and the launchd PID lookup can fail (job not loaded, no launchctl). Both
+    signals trust the recorded PID's identity only while that PID is still
+    alive: the lock body is written *after* the flock is acquired, so a
+    holder caught in the gap between a new process's acquire and its own
+    identity write still carries the *previous* holder's identity — if that
+    previous holder has since exited, treating its stale record as "the hub"
+    would clear an actual rogue.
 
     No hub plist installed -> single-writer deployments are normal -> OK.
     Lease free -> OK. Held by the hub -> OK. Held by anything else while a
@@ -707,17 +734,22 @@ def check_rogue_lease_holder(palace_path: str, home: "str | None" = None) -> Che
             )
 
         state = _read_mine_lock_state(palace_path)
+        if state.get("skipped"):
+            return _ok(name, "flock unavailable on this platform -- skipped")
         if not state["held"]:
             return _ok(name, "palace writer lease is free")
+
+        from .server_registry import _pid_alive
 
         pid = state["pid"]
         cmdline = state["cmdline"] or ""
         age_hours = state["age_hours"]
         holder_label = state["holder_label"]
 
+        pid_alive = pid is not None and _pid_alive(pid)
         hub_pid = _hub_launchd_pid(home=home)
-        is_hub = "--transport http" in cmdline or (
-            pid is not None and hub_pid is not None and pid == hub_pid
+        is_hub = pid_alive and (
+            "--transport http" in cmdline or (hub_pid is not None and pid == hub_pid)
         )
 
         if is_hub:
@@ -726,6 +758,11 @@ def check_rogue_lease_holder(palace_path: str, home: "str | None" = None) -> Che
                 f"palace writer lease held by the hub ({holder_label})",
                 pid=pid,
                 cmdline=cmdline,
+            )
+
+        if pid is not None and not pid_alive:
+            holder_label = (
+                f"{holder_label} -- recorded PID {pid} is no longer running, identity is stale"
             )
 
         age_str = f"; held for {age_hours:.1f}h" if age_hours is not None else ""

@@ -1292,10 +1292,12 @@ def _write_lock_holder(lock_file) -> None:
 def mine_palace_lock_path(palace_path: str) -> str:
     """The lock file path `mine_palace_lock` uses for ``palace_path``.
 
-    Pure path derivation, no I/O beyond ``lock_dir`` not needing to exist
-    yet for the caller to compute it. Shared with read-only probes (e.g.
-    the doctor `rogue_lease_holder` check) so the key derivation — realpath
-    + normcase + sha256 — never drifts between the acquirer and a reader.
+    Deterministic, but not pure: ``os.path.realpath`` stats the path to
+    resolve symlinks, so this touches the filesystem even though neither
+    ``palace_path`` nor ``lock_dir`` needs to exist yet for the caller to
+    compute it. Shared with read-only probes (e.g. the doctor
+    `rogue_lease_holder` check) so the key derivation — realpath + normcase
+    + sha256 — never drifts between the acquirer and a reader.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     resolved = os.path.realpath(os.path.expanduser(palace_path))

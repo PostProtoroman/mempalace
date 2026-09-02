@@ -463,6 +463,9 @@ class TestRogueLeaseHolder:
         assert result.status == "ok"
         assert "single-writer" in result.reason
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_free_lease_is_ok(self, tmp_path, monkeypatch):
         """A lock file that exists but is unheld (stale identity from a prior
         holder still on disk) must probe as free, not as held."""
@@ -480,6 +483,9 @@ class TestRogueLeaseHolder:
         assert result.status == "ok"
         assert "free" in result.reason
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_no_lock_file_at_all_is_ok(self, tmp_path, monkeypatch):
         monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
         self._isolate_home(monkeypatch, tmp_path)
@@ -488,6 +494,9 @@ class TestRogueLeaseHolder:
         assert result.status == "ok"
         assert "free" in result.reason
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_held_by_non_hub_process_warns(self, tmp_path, monkeypatch):
         from tests.test_palace_locks import _get_mp_context, _hold_lock_with_argv
 
@@ -525,6 +534,9 @@ class TestRogueLeaseHolder:
             open(release, "w").close()
             holder.join(timeout=5)
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_held_by_hub_cmdline_is_ok(self, tmp_path, monkeypatch):
         """Recorded identity carrying '--transport http' (the hub's own
         exec'd argv) is enough to clear it, even without a launchd PID
@@ -560,6 +572,9 @@ class TestRogueLeaseHolder:
             open(release, "w").close()
             holder.join(timeout=5)
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_held_by_matching_launchd_pid_is_ok(self, tmp_path, monkeypatch):
         """A holder whose command line doesn't say '--transport http' still
         clears as the hub when its PID matches the launchd job's PID."""
@@ -595,6 +610,9 @@ class TestRogueLeaseHolder:
             open(release, "w").close()
             holder.join(timeout=5)
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX flock-based lease probe -- not exercised on Windows"
+    )
     def test_never_leaves_the_lock_held(self, tmp_path, monkeypatch):
         """Probing a free lease must not leave it locked for a real acquirer."""
         from mempalace.palace import mine_palace_lock
@@ -610,6 +628,54 @@ class TestRogueLeaseHolder:
         # If the probe leaked its flock, this would raise MineAlreadyRunning.
         with mine_palace_lock(palace):
             pass
+
+    def test_hub_launchd_pid_parses_real_launchctl_output(self, monkeypatch):
+        """Pin the ``launchctl print`` output format against a captured
+        real-world sample -- the ``pid = <n>`` line lookup has no coverage
+        otherwise (``_hub_launchd_pid`` is monkeypatched out in every other
+        test here). ``shutil``/``subprocess`` are imported *inside*
+        ``_hub_launchd_pid``, so patching the real modules (not
+        ``doctor.shutil``/``doctor.subprocess``, which don't exist as
+        module-level attributes) is what actually reaches it."""
+        import shutil
+        import subprocess
+
+        captured_stdout = (
+            "gui/501/ai.mempalace.hub = {\n"
+            "\tactive count = 1\n"
+            "\tpath = /Users/proto/Library/LaunchAgents/ai.mempalace.hub.plist\n"
+            "\ttype = LaunchAgent\n"
+            "\tstate = running\n"
+            "\n"
+            "\tprogram = /venv/bin/python3\n"
+            "\tpid = 8905\n"
+            "\timmediate reason = ...\n"
+            "}\n"
+        )
+
+        class _FakeResult:
+            returncode = 0
+            stdout = captured_stdout
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(shutil, "which", lambda name: "/bin/launchctl")
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+
+        assert doctor._hub_launchd_pid() == 8905
+
+    def test_hub_launchd_pid_none_on_nonzero_returncode(self, monkeypatch):
+        import shutil
+        import subprocess
+
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+
+        monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(shutil, "which", lambda name: "/bin/launchctl")
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+
+        assert doctor._hub_launchd_pid() is None
 
 
 class TestUpstreamDrift:
