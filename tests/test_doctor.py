@@ -53,6 +53,56 @@ def test_secrets_sample_bound_respected(collection, palace_path):
     assert result.details["scanned"] == 3
 
 
+# ── lost mine jobs ───────────────────────────────────────────────────
+
+
+def test_lost_mine_jobs_skips_records_whose_pid_is_still_alive(tmp_dir):
+    """A `started` job whose hub is still alive is not "lost" — it is running.
+
+    `mempalace doctor` can run from a separate process while a hub is
+    legitimately mid-mine (unlike the hub's own startup path, it has no
+    `exclude_pid` trick available), so it must fall back to a liveness check
+    instead: a record naming a live pid is skipped, one naming a dead pid is
+    reported.
+    """
+    from mempalace.mine_queue import JOURNAL_FILENAME
+
+    palace_path = os.path.join(tmp_dir, "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    journal = os.path.join(palace_path, JOURNAL_FILENAME)
+    dead_pid = 999999
+    live_pid = os.getpid()
+    with open(journal, "w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "event": "mine_job",
+                    "job_id": "m-live",
+                    "state": "started",
+                    "source": "/p/live.jsonl",
+                    "pid": live_pid,
+                }
+            )
+            + "\n"
+        )
+        fh.write(
+            json.dumps(
+                {
+                    "event": "mine_job",
+                    "job_id": "m-dead",
+                    "state": "started",
+                    "source": "/p/dead.jsonl",
+                    "pid": dead_pid,
+                }
+            )
+            + "\n"
+        )
+
+    lost = doctor._lost_mine_jobs(palace_path)
+    lost_ids = {r["job_id"] for r in lost}
+    assert lost_ids == {"m-dead"}
+
+
 # ── capture liveness ──────────────────────────────────────────────────
 
 

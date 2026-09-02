@@ -3854,18 +3854,40 @@ def _mine_execute_on_hub(src: str, should_stop=None, **kwargs) -> dict:
     from .mine_lock import GuardedFileLock
 
     factory = _hub_mine_file_lock
+    stoppable = None
     if should_stop is not None:
-        factory = _StoppableFileLockFactory(_hub_mine_file_lock, should_stop)
+        factory = stoppable = _StoppableFileLockFactory(_hub_mine_file_lock, should_stop)
     with GuardedFileLock(factory) as guarded:
-        return _mine_execute(src, file_lock=guarded, **kwargs)
+        result = _mine_execute(src, file_lock=guarded, **kwargs)
+    # ``FileLockCursor.iter`` only ever calls ``should_stop`` at a file
+    # boundary it is about to act on, so "it returned True at least once"
+    # means iteration was actually cut short — not merely that stop() was
+    # requested at some point, which can be true even after the mine's last
+    # file finished on its own. ``_finish`` needs that distinction to avoid
+    # journalling a completed mine as "interrupted".
+    if stoppable is not None and isinstance(result, dict):
+        result = dict(result)
+        result["cut_short"] = stoppable.observed_stop
+    return result
 
 
 class _StoppableFileLockFactory:
-    """``_hub_mine_file_lock`` plus a ``should_stop`` predicate."""
+    """``_hub_mine_file_lock`` plus a ``should_stop`` predicate.
+
+    Also records whether that predicate was ever actually observed True, so
+    the caller can tell "asked to stop" from "stop actually cut off a file".
+    """
 
     def __init__(self, factory, should_stop):
         self._factory = factory
-        self.should_stop = should_stop
+        self._should_stop = should_stop
+        self.observed_stop = False
+
+    def should_stop(self) -> bool:
+        stopped = bool(self._should_stop())
+        if stopped:
+            self.observed_stop = True
+        return stopped
 
     def __call__(self, label: str):
         return self._factory(label)

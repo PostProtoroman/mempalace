@@ -128,9 +128,18 @@ def unfinished_jobs(journal_path: Optional[str], exclude_pid: Optional[int] = No
     Best-effort by construction: a missing, truncated or half-written journal
     yields fewer rows, never an exception — this is diagnostics, and it must
     not be able to stop a hub from starting.
+
+    A record whose ``pid`` is still alive is never "lost" — its hub is simply
+    still mid-mine, whether that's the process asking (already handled by
+    ``exclude_pid``) or a different hub the caller has no other way to know
+    about (a doctor run, say, invoked from a separate process while the hub
+    that accepted the job is still running it). Reuses the same liveness
+    check as the writer-lease reclamation path.
     """
     if not journal_path:
         return []
+    from .server_registry import _pid_alive
+
     try:
         size = os.path.getsize(journal_path)
         with open(journal_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -160,6 +169,7 @@ def unfinished_jobs(journal_path: Optional[str], exclude_pid: Optional[int] = No
         for record in latest.values()
         if record.get("state") not in TERMINAL_STATES
         and (exclude_pid is None or record.get("pid") != exclude_pid)
+        and not _pid_alive(record.get("pid"))
     ]
 
 
@@ -243,6 +253,19 @@ class MineQueue:
         self._journal_path = journal_path
         self._name = name
         self._cond = threading.Condition()
+        # Journal writes happen off the condition lock (see submit()/_finish()
+        # docstrings), so the threads doing the actual file I/O can be
+        # scheduled in a different order than their records were logically
+        # produced in. ``seq`` is assigned — under whatever lock was already
+        # held — at the moment a record is built, in true logical order; the
+        # small ``_journal_cond``/``_journal_next_seq`` pair below then makes
+        # each writer wait its turn so records still land on disk in that
+        # same order, without any of them needing the (much hotter) queue
+        # condition lock while they wait or write.
+        self._seq_lock = threading.Lock()
+        self._seq = 0
+        self._journal_cond = threading.Condition()
+        self._journal_next_seq = 1
         self._pending: list[MineJob] = []
         self._running: Optional[MineJob] = None
         self._by_key: dict[str, MineJob] = {}
@@ -368,13 +391,17 @@ class MineQueue:
             )
             self._by_key[key] = job
             self._pending.append(job)
-            # Journalled the moment it is accepted, because that is the moment
-            # the CLI tells the operator "hub queued mine as <id>": if the hub
-            # dies before the job runs, this line is the only evidence it ever
-            # existed. Written before the notify, and so before any chance of
-            # the worker's "started" line, so the journal reads in order.
-            self._append_journal(self._journal_record(job, {"success": True}, state="accepted"))
+            # The "accepted" record is the only evidence a job ever existed
+            # if the hub dies before it runs, so it is built (and its ``seq``
+            # assigned) right here, before the notify — guaranteeing it is
+            # logically ordered ahead of any "started" record _next_job can
+            # produce, since that requires this same lock. The actual file
+            # write happens after the lock is released, below: submit()'s
+            # caller should not pay for journal I/O while holding the queue
+            # lock and blocking the worker's own state transitions.
+            record = self._journal_record(job, {"success": True}, state="accepted")
             self._cond.notify_all()
+        self._append_journal(record)
         return job, True
 
     def position(self, job: MineJob) -> int:
@@ -486,10 +513,17 @@ class MineQueue:
             job.result = result
             job.finished_at = time.time()
             if result.get("success"):
-                # A job that was asked to stop finished at a file boundary, so
-                # it is partial by construction — "succeeded" would be a lie
-                # to whoever reads the journal after the restart.
-                job.state = "interrupted" if job.should_stop() else "succeeded"
+                # ``cut_short`` (set by the runner from the file-lock cursor's
+                # own observation) says whether iteration actually broke off
+                # at a file boundary — not just whether stop() was ever
+                # requested, which can go true after the last file already
+                # finished on its own. Fall back to should_stop() only when
+                # the runner didn't report it, so older/stub runners keep
+                # their previous behavior.
+                cut_short = result.get("cut_short")
+                if cut_short is None:
+                    cut_short = job.should_stop()
+                job.state = "interrupted" if cut_short else "succeeded"
             else:
                 job.state = "failed"
             self._running = None
@@ -508,10 +542,16 @@ class MineQueue:
         job.done.set()
         self._append_journal(record)
 
+    def _next_seq(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
+
     def _journal_record(self, job: MineJob, result: dict, state: Optional[str] = None) -> dict:
         counts = parse_mine_summary(result.get("output"))
         record = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "seq": self._next_seq(),
             "event": "mine_job",
             "job_id": job.id,
             "source": job.source,
@@ -531,9 +571,32 @@ class MineQueue:
         return record
 
     def _append_journal(self, record: dict) -> None:
-        """Best-effort: a journal failure must never fail a mine that ran."""
+        """Best-effort: a journal failure must never fail a mine that ran.
+
+        Waits for records with a lower ``seq`` to be written first, so the
+        journal's on-disk order matches the true logical order even though no
+        caller holds the queue's condition lock while this runs. The wait is
+        bounded — a lost or never-appended seq (there is none on any current
+        call path, but this is diagnostics and must not be able to wedge a
+        hub) degrades to writing out of order rather than blocking forever.
+        """
         if not self._journal_path:
             return
+        seq = record.get("seq")
+        if seq is not None:
+            with self._journal_cond:
+                deadline = time.monotonic() + 5.0
+                while self._journal_next_seq < seq:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._journal_cond.wait(remaining):
+                        break
+                self._write_journal_line(record)
+                self._journal_next_seq = max(self._journal_next_seq, seq + 1)
+                self._journal_cond.notify_all()
+            return
+        self._write_journal_line(record)
+
+    def _write_journal_line(self, record: dict) -> None:
         try:
             with open(self._journal_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")

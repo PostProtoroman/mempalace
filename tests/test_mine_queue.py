@@ -695,16 +695,16 @@ def test_unfinished_jobs_reports_the_previous_runs_casualties(tmp_path):
     journal = tmp_path / "mine_jobs.jsonl"
     rows = [
         # A job that ran to completion in the old process — not a casualty.
-        {"event": "mine_job", "job_id": "m1", "state": "accepted", "pid": 111},
-        {"event": "mine_job", "job_id": "m1", "state": "started", "pid": 111},
-        {"event": "mine_job", "job_id": "m1", "state": "succeeded", "pid": 111},
+        {"event": "mine_job", "job_id": "m1", "state": "accepted", "pid": 999999999},
+        {"event": "mine_job", "job_id": "m1", "state": "started", "pid": 999999999},
+        {"event": "mine_job", "job_id": "m1", "state": "succeeded", "pid": 999999999},
         # Accepted, started, and then the process died: this is the one.
-        {"event": "mine_job", "job_id": "m2", "state": "accepted", "pid": 111},
-        {"event": "mine_job", "job_id": "m2", "state": "started", "pid": 111},
+        {"event": "mine_job", "job_id": "m2", "state": "accepted", "pid": 999999999},
+        {"event": "mine_job", "job_id": "m2", "state": "started", "pid": 999999999},
         # Accepted and never even started.
-        {"event": "mine_job", "job_id": "m3", "state": "accepted", "pid": 111},
+        {"event": "mine_job", "job_id": "m3", "state": "accepted", "pid": 999999999},
         # Explicitly dropped at a clean shutdown — recorded, so not "unknown".
-        {"event": "mine_job", "job_id": "m4", "state": "dropped", "pid": 111},
+        {"event": "mine_job", "job_id": "m4", "state": "dropped", "pid": 999999999},
         # This process's own in-flight job must not look like a casualty.
         {"event": "mine_job", "job_id": "m5", "state": "started", "pid": 222},
         "{not json",
@@ -891,3 +891,145 @@ def test_a_real_mine_takes_the_lock_once_per_source_file(tmp_path):
     # left held" looks like from outside.
     assert [kind for kind, _ in lock.events] == ["acquire", "release"] * (len(lock.events) // 2)
     assert len(lock.events) % 2 == 0
+
+
+# ── review nits (2026-09-02 follow-up) ─────────────────────────────────────
+
+
+def test_unfinished_jobs_skips_a_record_whose_pid_is_alive(tmp_path):
+    """A separate process (e.g. `mempalace doctor`) has no `exclude_pid` trick
+
+    available, so a `started` record naming a still-alive hub must not be
+    reported as lost — only a dead one should be.
+    """
+    import os as _os
+
+    from mempalace.mine_queue import unfinished_jobs
+
+    journal = tmp_path / "mine_jobs.jsonl"
+    rows = [
+        {"event": "mine_job", "job_id": "m-alive", "state": "started", "pid": _os.getpid()},
+        {"event": "mine_job", "job_id": "m-dead", "state": "started", "pid": 999999},
+    ]
+    journal.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    lost = {r["job_id"] for r in unfinished_jobs(str(journal))}
+    assert lost == {"m-dead"}
+
+
+def test_stoppable_factory_only_observes_a_stop_that_actually_fires():
+    flag = {"stop": False}
+    factory = mcp_server._StoppableFileLockFactory(_RecordingLock(), lambda: flag["stop"])
+    assert factory.should_stop() is False
+    assert factory.observed_stop is False
+    flag["stop"] = True
+    assert factory.should_stop() is True
+    assert factory.observed_stop is True
+
+
+def test_finish_journals_succeeded_when_the_mine_completed_before_stop_was_noticed(tmp_path):
+    """A job whose last file already completed is not "interrupted", even if
+
+    stop() happened to be called at some point during its run — the cursor
+    never actually cut iteration short, so the journal must say so.
+    """
+
+    def runner(job):
+        job.stop_requested.set()  # stop() raced in, but after the last file
+        return {"success": True, "output": "", "cut_short": False}
+
+    q = _queue(runner, tmp_path)
+    job, _ = q.submit(source="/tmp/a", mode="convos")
+    assert job.wait(5)
+    assert job.state == "succeeded"
+    q.stop()
+
+    records = [json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()]
+    finished = [
+        r for r in records if r["job_id"] == job.id and r["state"] in ("succeeded", "interrupted")
+    ]
+    assert [r["state"] for r in finished] == ["succeeded"]
+
+
+def test_finish_journals_interrupted_when_the_cursor_actually_cut_iteration_short(tmp_path):
+    def runner(job):
+        return {"success": True, "output": "", "cut_short": True}
+
+    q = _queue(runner, tmp_path)
+    job, _ = q.submit(source="/tmp/a", mode="convos")
+    assert job.wait(5)
+    assert job.state == "interrupted"
+    q.stop()
+
+    records = [json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()]
+    finished = [
+        r for r in records if r["job_id"] == job.id and r["state"] in ("succeeded", "interrupted")
+    ]
+    assert [r["state"] for r in finished] == ["interrupted"]
+
+
+def test_submit_does_not_hold_the_condition_lock_during_journal_io(tmp_path):
+    """Journal I/O in submit() must happen after the lock is released, so a
+
+    slow disk cannot block the worker's own state transitions (_next_job
+    needs the same lock to pop a job).
+    """
+    journal = tmp_path / "mine_jobs.jsonl"
+    q = MineQueue(lambda job: {"success": True}, journal_path=str(journal))
+
+    writing = threading.Event()
+    release_write = threading.Event()
+    real_append = q._append_journal
+
+    def slow_append(record):
+        writing.set()
+        release_write.wait(5)
+        real_append(record)
+
+    q._append_journal = slow_append
+    q.start()
+    try:
+        t = threading.Thread(target=lambda: q.submit(source="/tmp/a", mode="convos"))
+        t.start()
+        assert writing.wait(5)
+        # submit()'s journal write is in flight (blocked on release_write);
+        # the condition lock must already be free for other cond-holding
+        # calls to proceed.
+        acquired = q._cond.acquire(timeout=2)
+        assert acquired, "condition lock still held during journal I/O in submit()"
+        q._cond.release()
+        release_write.set()
+        t.join(5)
+    finally:
+        release_write.set()
+        q.stop()
+
+
+def test_journal_seq_is_strictly_ordered_regardless_of_write_order(tmp_path):
+    """``seq`` reflects true logical order even if two records' file writes
+
+    land out of order — accepted must always carry a lower seq than the
+    started record for the same job, since both are assigned under the same
+    lock that also gates the pop from pending to running.
+    """
+    release = threading.Event()
+
+    def runner(job):
+        release.wait(5)
+        return {"success": True, "output": ""}
+
+    q = _queue(runner, tmp_path)
+    try:
+        job, _ = q.submit(source="/tmp/a", mode="convos")
+        # Give the worker a moment to pop the job and journal "started".
+        for _ in range(50):
+            if job.state == "running":
+                break
+            time.sleep(0.02)
+    finally:
+        release.set()
+        q.stop()
+
+    records = [json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()]
+    by_state = {r["state"]: r["seq"] for r in records if r["job_id"] == job.id}
+    assert by_state["accepted"] < by_state["started"]
