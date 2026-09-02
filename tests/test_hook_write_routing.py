@@ -318,7 +318,7 @@ def test_require_unavailable_blocks_every_direct_hook_write_path(
     ):
         with hooks_cli._hook_write_routing_context():
             hooks_cli._maybe_auto_ingest()
-            hooks_cli._mine_sync()
+            hooks_cli._mine_precompact()
 
             result = hooks_cli._save_diary_direct(
                 str(transcript),
@@ -476,7 +476,7 @@ def test_precompact_require_unavailable_skips_all_writes(
             "mempalace.hooks_cli._ingest_transcript",
         ) as ingest,
         patch(
-            "mempalace.hooks_cli._mine_sync",
+            "mempalace.hooks_cli._mine_precompact",
         ) as mine_sync,
         patch("mempalace.hooks_cli._log"),
     ):

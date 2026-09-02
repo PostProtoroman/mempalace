@@ -282,6 +282,83 @@ class TestForwardMineToHub:
         assert "forwarding mine to palace hub" in out
         assert "filed 1" in out
 
+    def test_parses_the_hubs_queued_reply_as_success(self, isolated_home, tmp_path, capsys):
+        """The hub answers an accepted mine with a job id, not a miner summary.
+
+        Mines run on the hub's background worker (one source file per lock
+        hold), so the forwarded call returns as soon as the job is queued.
+        The CLI must treat that as a completed forward — returning False here
+        would send the hook's mine down the direct path, straight into the
+        writer lease the hub holds for its lifetime.
+        """
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(
+            mine_result={
+                "success": True,
+                "queued": True,
+                "deduplicated": False,
+                "job_id": "mine-abc123",
+                "state": "queued",
+                "position": 2,
+            }
+        )
+        try:
+            _register_hub(palace, hub)
+            assert cli._forward_mine_to_hub(_mine_args(tmp_path), palace) is True
+        finally:
+            hub.stop()
+        out = capsys.readouterr().out
+        assert "hub queued mine as mine-abc123" in out
+        assert "position 2" in out
+        assert "already queued" not in out
+
+    def test_queued_reply_reports_a_deduplicated_job(self, isolated_home, tmp_path, capsys):
+        """A re-fire for the same source gets the existing job back, not a second one."""
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(
+            mine_result={
+                "success": True,
+                "queued": True,
+                "deduplicated": True,
+                "job_id": "mine-abc123",
+                "state": "running",
+                "position": 0,
+            }
+        )
+        try:
+            _register_hub(palace, hub)
+            assert cli._forward_mine_to_hub(_mine_args(tmp_path), palace) is True
+        finally:
+            hub.stop()
+        out = capsys.readouterr().out
+        assert "hub queued mine as mine-abc123 (already queued)" in out
+        # position 0 means "running", not "second in line" — don't print it.
+        assert "position" not in out
+
+    def test_queued_but_unsuccessful_reply_is_still_a_failure(
+        self, isolated_home, tmp_path, capsys
+    ):
+        """wait=true timing out returns queued *and* success=False; that is not an accept."""
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(
+            mine_result={
+                "success": False,
+                "queued": True,
+                "job_id": "mine-abc123",
+                "error": "mine job mine-abc123 has not finished within 600s",
+            }
+        )
+        try:
+            _register_hub(palace, hub)
+            with pytest.raises(SystemExit) as exc:
+                cli._forward_mine_to_hub(_mine_args(tmp_path), palace)
+        finally:
+            hub.stop()
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "hub queued mine as" not in captured.out
+        assert "hub mine failed" in captured.err
+
     def test_missing_mode_defaults_to_projects(self, isolated_home, tmp_path, fake_hub):
         """`mempalace mine <dir> --wing X` with no --mode leaves args.mode as
         None; forwarding it verbatim sends mode: null and the hub rejects it

@@ -15,10 +15,10 @@ HOOK_CONFIG = REPO_ROOT / ".claude-plugin" / "hooks" / "hooks.json"
 # synchronously, which touches chromadb. 10..30s is generous for that
 # work without leaving room for runaway hangs to freeze the session.
 #
-# PreCompact runs _mine_sync synchronously with a per-target subprocess
-# timeout of 60s in mempalace/hooks_cli.py. The hook-level floor of 60
-# keeps the inner bound from being truncated, and the ceiling of 90
-# bounds the worst case at ~30s above that.
+# PreCompact submits the project mine (_mine_precompact) without waiting,
+# but still runs _ingest_transcript in the foreground, which touches
+# chromadb. The floor of 60 keeps that work from being truncated, and the
+# ceiling of 90 bounds the worst case at ~30s above it.
 # SessionEnd backgrounds all of its work in the shell wrapper — the foreground
 # only forks the detached child and returns in milliseconds — so its timeout is
 # a generous backstop on a near-instant operation, not a synchronous-work bound

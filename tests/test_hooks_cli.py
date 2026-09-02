@@ -27,7 +27,7 @@ from mempalace.hooks_cli import (
     _mine_already_running,
     _mine_marker_path,
     _mine_rate_limited,
-    _mine_sync,
+    _mine_precompact,
     _parse_harness_input,
     _record_mine_fired,
     _safe_wing_slug,
@@ -1213,64 +1213,86 @@ def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
                         assert cmd[0] == "/fake/venv/python"
 
 
-def test_mine_sync_with_env_uses_projects_mode(tmp_path):
-    """Precompact sync path uses projects mode when MEMPAL_DIR is set."""
+def test_mine_precompact_with_env_uses_projects_mode(tmp_path):
+    """Precompact path submits a projects-mode mine when MEMPAL_DIR is set."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                _mine_sync()
-                mock_run.assert_called_once()
-                cmd = mock_run.call_args[0][0]
-                assert cmd[cmd.index("--mode") + 1] == "projects"
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _mine_precompact()
+                    mock_popen.assert_called_once()
+                    cmd = mock_popen.call_args[0][0]
+                    assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
-def test_mine_sync_daemon_lock_deferral_is_not_reported_as_a_failure(tmp_path):
-    """The precompact sync path waits (wait=True, timeout=60) but is documented as
-    living under the harness 30s ceiling, so a job it can never see go terminal is
-    doubly bad here: without stop_on_lock_deferral it burns past the ceiling and
-    then logs a failure for work the daemon still holds and will run."""
+def test_mine_precompact_does_not_wait_for_the_spawned_mine(tmp_path):
+    """Submit-and-return: PreCompact must never block the shell on a mine.
+
+    The old path was ``subprocess.run(..., timeout=60)``, which waited up to a
+    minute and then killed the mine mid-file. Against a live hub it waited for
+    the whole forwarded mine — the request the hub ran inline in its write path
+    until its own stall watchdog killed it (2026-09-02).
+    """
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
-    parked = {
-        "id": "job-parked",
-        "state": "queued",
-        "error": {
-            "error_class": "LockHeldByOtherProcess",
-            "message": "palace /p is held by PID 999 (mempalace-mcp)",
-        },
-        "result": None,
-    }
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                        _mine_precompact()
+
+    mock_popen.assert_called_once()
+    mock_run.assert_not_called()
+    proc = mock_popen.return_value
+    proc.wait.assert_not_called()
+    proc.communicate.assert_not_called()
+
+
+def test_mine_precompact_daemon_submission_does_not_block(tmp_path):
+    """The daemon route submits with wait=False and keeps the lock-deferral guard.
+
+    Waiting on the job (the old wait=True/timeout=60) put the harness ceiling
+    inside a mine's runtime. The submission still carries
+    ``stop_on_lock_deferral`` so a job parked behind the palace lock is not
+    reported as a failure — the daemon runs it when the holder exits (#2014).
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    submitted = {"id": "job-1", "state": "queued", "result": None}
     env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
     with patch.dict("os.environ", env):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+                with patch("mempalace.daemon.submit_job", return_value=submitted) as mock_submit:
                     with patch("mempalace.hooks_cli._log") as mock_log:
-                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                            _mine_sync()
+                        with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                            _mine_precompact()
 
+    assert mock_submit.call_args.kwargs["wait"] is False
     assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
-    mock_run.assert_not_called()  # the daemon owns it; spawning a mine would double-write
+    mock_popen.assert_not_called()  # the daemon owns it; spawning would double-write
 
     logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
-    assert "deferred" in logged
-    assert "PID 999" in logged
-    assert "Daemon sync mine failed" not in logged, "a parked job is not a failure"
+    assert "failed" not in logged
 
 
-def test_mine_sync_uses_mempalace_python(tmp_path):
-    """Sync mine command uses _mempalace_python(), not bare sys.executable."""
+def test_mine_precompact_uses_mempalace_python(tmp_path):
+    """Precompact mine command uses _mempalace_python(), not bare sys.executable."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._mempalace_python", return_value="/fake/venv/python"):
-                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                    _mine_sync()
-                    cmd = mock_run.call_args[0][0]
-                    assert cmd[0] == "/fake/venv/python"
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+                with patch(
+                    "mempalace.hooks_cli._mempalace_python", return_value="/fake/venv/python"
+                ):
+                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                        _mine_precompact()
+                        cmd = mock_popen.call_args[0][0]
+                        assert cmd[0] == "/fake/venv/python"
 
 
 def test_claim_mine_slot_writes_live_placeholder_pid(tmp_path):
@@ -1329,12 +1351,12 @@ def test_maybe_auto_ingest_ignores_transcript_arg_path(tmp_path):
                     mock_popen.assert_not_called()
 
 
-def test_mine_sync_ignores_transcript(tmp_path):
-    """_mine_sync does not run a convos mine for the transcript dir.
+def test_mine_precompact_ignores_transcript(tmp_path):
+    """_mine_precompact does not run a convos mine for the transcript dir.
 
     The precompact transcript ingest is the responsibility of
-    _ingest_transcript; routing it through _mine_sync would stack a
-    second 60s timeout against the harness 30s ceiling.
+    _ingest_transcript; routing it through _mine_precompact would submit the
+    same transcript twice.
     """
     convo_dir = tmp_path / "convos"
     convo_dir.mkdir()
@@ -1342,9 +1364,9 @@ def test_mine_sync_ignores_transcript(tmp_path):
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                _mine_sync()
-                mock_run.assert_not_called()
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                _mine_precompact()
+                mock_popen.assert_not_called()
 
 
 def test_maybe_auto_ingest_oserror(tmp_path):
@@ -2109,53 +2131,62 @@ def test_stop_hook_oserror_on_write(tmp_path):
 
 
 def test_precompact_with_mempal_dir(tmp_path):
-    """Precompact runs subprocess.run (sync) when MEMPAL_DIR is set."""
+    """Precompact submits the project mine (detached Popen) when MEMPAL_DIR is set."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                result = _capture_hook_output(
+                    hook_precompact,
+                    {"session_id": "test"},
+                    state_dir=tmp_path,
+                )
     assert result == {}
-    mock_run.assert_called_once()
+    mock_popen.assert_called_once()
 
 
 def test_precompact_with_mempal_dir_oserror(tmp_path):
-    """Precompact handles OSError from subprocess gracefully."""
+    """Precompact handles OSError from the spawn gracefully -- still allows."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run", side_effect=OSError("fail")):
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("fail")):
+                result = _capture_hook_output(
+                    hook_precompact,
+                    {"session_id": "test"},
+                    state_dir=tmp_path,
+                )
     assert result == {}
 
 
-def test_precompact_with_timeout(tmp_path):
-    """Precompact handles TimeoutExpired gracefully -- still allows."""
+def test_precompact_never_waits_on_the_mine(tmp_path):
+    """Replaces the old TimeoutExpired test: there is no timeout to expire now.
+
+    PreCompact used to run the mine with ``subprocess.run(timeout=60)``, so it
+    had to survive a TimeoutExpired that killed the mine mid-file. It now
+    submits and returns, so the guarantee worth pinning is the absence of any
+    blocking call at all.
+    """
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch(
-            "mempalace.hooks_cli.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="mine", timeout=60),
-        ):
-            result = _capture_hook_output(
-                hook_precompact, {"session_id": "test"}, state_dir=tmp_path
-            )
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                    result = _capture_hook_output(
+                        hook_precompact, {"session_id": "test"}, state_dir=tmp_path
+                    )
     assert result == {}
+    mock_run.assert_not_called()
+    mock_popen.return_value.wait.assert_not_called()
 
 
 def test_precompact_mines_only_active_transcript(tmp_path, monkeypatch):
     """Precompact ingests the active transcript via _ingest_transcript.
 
-    With no MEMPAL_DIR, _mine_sync is a no-op; the transcript ingest is
+    With no MEMPAL_DIR, _mine_precompact is a no-op; the transcript ingest is
     the only mining that should fire, and it goes through Popen
     (background) inside _ingest_transcript. Pre-#1231-review this test
     asserted against subprocess.run, which corresponded to the
@@ -2290,7 +2321,7 @@ def test_precompact_hook_enabled_by_default(tmp_path):
     """When auto_save is true, precompact mines synchronously then returns {}."""
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
-        with patch("mempalace.hooks_cli._mine_sync") as mock_mine:
+        with patch("mempalace.hooks_cli._mine_precompact") as mock_mine:
             result = _capture_hook_output(
                 hook_precompact,
                 {"session_id": "test"},
@@ -2452,7 +2483,7 @@ def test_run_hook_dispatches_session_end():
 
 def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     """SessionEnd must spawn the detached ingest/auto-ingest and NEVER call the
-    synchronous ``_mine_sync``: the foreground SessionEnd budget (~1.5s, which a
+    ``_mine_precompact``: the foreground SessionEnd budget (~1.5s, which a
     plugin-provided per-hook timeout cannot raise) would kill a synchronous mine
     before it saved anything.
     """
@@ -2473,7 +2504,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
             ) as mock_save,
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
-            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+            patch("mempalace.hooks_cli._mine_precompact") as mock_sync,
         ):
             result = _capture_hook_output(
                 hook_session_end,
@@ -2600,7 +2631,7 @@ def test_session_end_auto_ingest_only_when_no_transcript(tmp_path):
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
             patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
-            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+            patch("mempalace.hooks_cli._mine_precompact") as mock_sync,
         ):
             result = _capture_hook_output(
                 hook_session_end,
@@ -2657,7 +2688,7 @@ def test_session_end_accepts_full_sessionend_payload(tmp_path):
             ),
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
-            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+            patch("mempalace.hooks_cli._mine_precompact") as mock_sync,
         ):
             result = _capture_hook_output(
                 hook_session_end,
@@ -2866,7 +2897,7 @@ def test_precompact_checkpoints_when_mining_disabled(tmp_path):
             with patch(
                 "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5}
             ) as mock_save:
-                with patch("mempalace.hooks_cli._mine_sync"):
+                with patch("mempalace.hooks_cli._mine_precompact"):
                     _capture_hook_output(
                         hook_precompact,
                         {"session_id": "test", "transcript_path": str(transcript)},
