@@ -3758,6 +3758,145 @@ def _capture_fd_stdout(fn):
             os.close(saved_fd)
 
 
+# ── Background mine jobs (writable HTTP hub only) ────────────────────────
+#
+# Set by _start_mine_queue() when a writable HTTP hub starts. While it is
+# None every mine runs inline, which is the stdio/embedded/read-only contract
+# and the one every existing caller and test expects.
+_MINE_QUEUE = None
+_MINE_QUEUE_LOCK = threading.Lock()
+_MINE_ASYNC_ENV = "MEMPALACE_MCP_MINE_ASYNC"
+_MINE_WAIT_ENV = "MEMPALACE_MCP_MINE_WAIT_SECS"
+_MINE_WAIT_DEFAULT = 600.0
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _mine_async_disabled() -> bool:
+    """Operator kill switch: ``MEMPALACE_MCP_MINE_ASYNC=0`` restores inline mines."""
+    return os.environ.get(_MINE_ASYNC_ENV, "").strip().lower() in _FALSY
+
+
+def _mine_wait_timeout(explicit=None) -> float:
+    if explicit is not None:
+        try:
+            value = float(explicit)
+        except (TypeError, ValueError):
+            value = _MINE_WAIT_DEFAULT
+        return max(1.0, value)
+    raw = os.environ.get(_MINE_WAIT_ENV, "").strip()
+    if not raw:
+        return _MINE_WAIT_DEFAULT
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; using %.0fs", _MINE_WAIT_ENV, raw, _MINE_WAIT_DEFAULT
+        )
+        return _MINE_WAIT_DEFAULT
+
+
+@contextlib.contextmanager
+def _hub_mine_file_lock(label: str):
+    """Hold the hub's exclusive dispatch lock for one source file of a mine.
+
+    This is the whole point of the change: the exclusive side of
+    ``_HTTP_REQUEST_LOCK`` — the same side ``_http_dispatch`` gives mutating
+    tools — is taken and released per file, so another agent's add_drawer
+    waits for one file, not for a whole 80 MB transcript. The stall watchdog
+    is armed per file too (``force=True``), so a genuinely wedged chromadb
+    write still trips it while a long-but-progressing job never does.
+    """
+    with _HTTP_REQUEST_LOCK:
+        with _write_stall_watch(f"mempalace_mine[{os.path.basename(label) or label}]", force=True):
+            yield
+
+
+def _mine_execute_on_hub(src: str, **kwargs) -> dict:
+    """``_mine_execute`` under the hub's per-file write lock.
+
+    The miners release their per-file hold on the paths they guard, but not on
+    all of them — ``convo_miner`` runs its whole file loop outside its
+    ``try``/``finally``, and both it and ``miner`` open their collections
+    outside it (see :class:`~mempalace.mine_lock.GuardedFileLock`). Off the
+    hub a leaked hold is a no-op object; here it is the exclusive dispatch
+    lock, and one leaked past a mine that raised would wedge every subsequent
+    write by every agent — permanently, silently, and worse than the restart
+    storm this change exists to stop. So the lock's owner guarantees the
+    release instead of trusting three miners' control flow to.
+    """
+    from .mine_lock import GuardedFileLock
+
+    with GuardedFileLock(_hub_mine_file_lock) as guarded:
+        return _mine_execute(src, file_lock=guarded, **kwargs)
+
+
+def _run_mine_job(job) -> dict:
+    """Worker entry point: run one queued job on the hub's own handles."""
+    return _mine_execute_on_hub(
+        job.source,
+        mode=job.mode,
+        wing=job.wing,
+        agent=job.agent,
+        limit=job.limit,
+        dry_run=job.dry_run,
+        extract=job.extract,
+    )
+
+
+def _start_mine_queue():
+    """Start the hub's background mine worker. Returns the queue, or None.
+
+    Read-only servers never mine, and the kill switch keeps the old inline
+    behavior available without a downgrade.
+    """
+    global _MINE_QUEUE
+    if _READ_ONLY or _mine_async_disabled():
+        return None
+    from .mine_queue import JOURNAL_FILENAME, MineQueue
+
+    with _MINE_QUEUE_LOCK:
+        if _MINE_QUEUE is None:
+            journal = (
+                os.path.join(os.path.expanduser(_config.palace_path), JOURNAL_FILENAME)
+                if _config.palace_path
+                else None
+            )
+            _MINE_QUEUE = MineQueue(_run_mine_job, journal_path=journal)
+            _MINE_QUEUE.start()
+            logger.info(
+                "Hub mine queue started; mempalace_mine now enqueues and returns a job id "
+                "(journal: %s). Set %s=0 for inline mines.",
+                journal or "<none>",
+                _MINE_ASYNC_ENV,
+            )
+    return _MINE_QUEUE
+
+
+def _stop_mine_queue(timeout: float = 30.0) -> None:
+    """Stop the mine worker and forget the queue.
+
+    Called on the way out of the HTTP loop, before the writer lease is
+    released: a worker still inside a file when the lease goes back would be
+    writing to a palace this process no longer owns. The subsequent
+    ``with _HTTP_REQUEST_LOCK`` around the release is the hard barrier — it
+    cannot be taken until the worker's current per-file hold ends — this just
+    stops it from starting another job first. Queued jobs are dropped; the
+    hooks that submitted them fire again.
+    """
+    global _MINE_QUEUE
+    with _MINE_QUEUE_LOCK:
+        queue, _MINE_QUEUE = _MINE_QUEUE, None
+    if queue is not None:
+        queue.stop(timeout)
+
+
+def _mine_queue_status() -> dict:
+    queue = _MINE_QUEUE
+    if queue is None:
+        return {"enabled": False}
+    return queue.status()
+
+
 def tool_mine(
     source: str,
     mode: str = "projects",
@@ -3766,8 +3905,24 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    wait: bool = False,
+    wait_timeout: float = None,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
+
+    On the writable HTTP hub this **enqueues** the mine and returns at once
+    with a job id (see :mod:`mempalace.mine_queue`); everywhere else — stdio,
+    embedded, read-only, and any hub with ``MEMPALACE_MCP_MINE_ASYNC=0`` — it
+    still runs inline and returns the miner's summary. ``wait=True`` asks for
+    the old synchronous contract on the hub too, bounded by ``wait_timeout``
+    (default ``MEMPALACE_MCP_MINE_WAIT_SECS``, 600s).
+
+    Why: a 20-80 MB transcript mine took minutes inside the hub's exclusive
+    dispatch lock, every peer agent's palace write queued behind it, and the
+    write-stall watchdog read the single long hold as a wedged chromadb write
+    and killed the process (2026-09-02, four kills in fifteen minutes). The
+    work now happens on a worker thread that takes that lock one source file
+    at a time.
 
     Lets MCP clients that cannot shell out (Claude Desktop, LM Studio, Aionui,
     Desktop Commander) trigger indexing in-conversation (#1662). Wraps the same
@@ -3787,18 +3942,15 @@ def tool_mine(
     extract: convos extraction strategy — ``"exchange"`` (default) or
              ``"general"``; ignored by the other modes.
 
-    Runs synchronously and mirrors the :func:`tool_sync` contract: success
-    returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
+    The inline contract mirrors :func:`tool_sync`: success returns
+    ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
     the miner's human-readable summary (captured so it cannot corrupt the
     JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
-    The palace write lock is held by the miners themselves, so a concurrent mine
-    surfaces as a structured already-running error. Orphan cleanup is not part of
-    mining — use ``mempalace_sync`` for that.
+    The queued contract returns ``{success: True, queued: True, job_id, state,
+    position, deduplicated}``. The palace write lock is held by the miners
+    themselves, so a concurrent mine surfaces as a structured already-running
+    error. Orphan cleanup is not part of mining — use ``mempalace_sync``.
     """
-    global _metadata_cache
-    from .daemon import LOCK_REFUSAL_ERROR_CLASS
-    from .palace import MineAlreadyRunning, MineValidationError
-
     if not _config.palace_path:
         np = _no_palace()
         return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
@@ -3822,6 +3974,80 @@ def tool_mine(
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
         return {"success": False, "error": f"source not found: {source!r}"}
 
+    queue = _MINE_QUEUE
+    # A dry run writes nothing and its whole value is the summary it prints,
+    # so it stays inline even on the hub — just with the same per-file lock.
+    if queue is not None and not dry_run:
+        job, created = queue.submit(
+            source=src,
+            mode=mode,
+            wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract=extract,
+        )
+        if not wait:
+            return queue.queued_payload(job, created)
+        timeout = _mine_wait_timeout(wait_timeout)
+        if job.wait(timeout):
+            result = dict(job.result or {})
+            result["job_id"] = job.id
+            return result
+        # Still running. Don't report success — the caller asked for the
+        # synchronous contract and didn't get it — but hand back the job id so
+        # it can be followed in mempalace_status instead of being re-submitted.
+        payload = queue.queued_payload(job, created)
+        payload.update(
+            {
+                "success": False,
+                "error": (
+                    f"mine job {job.id} has not finished within {timeout:.0f}s; "
+                    "it is still running in the hub worker (see mempalace_status)"
+                ),
+                "error_class": "MineWaitTimeout",
+                "timed_out": True,
+            }
+        )
+        return payload
+
+    # On the hub this call is dispatched lock-free, so it has to take the
+    # write lock itself, per file. Off the hub the dispatcher already holds
+    # it and the mine runs unlocked, exactly as before.
+    runner = _mine_execute_on_hub if queue is not None else _mine_execute
+    return runner(
+        src,
+        mode=mode,
+        wing=wing,
+        agent=agent,
+        limit=limit,
+        dry_run=dry_run,
+        extract=extract,
+    )
+
+
+def _mine_execute(
+    src: str,
+    *,
+    mode: str,
+    wing: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    extract: str = "exchange",
+    file_lock=None,
+):
+    """Run one mine in this thread and return the structured tool result.
+
+    Split out of :func:`tool_mine` so the hub's background worker runs exactly
+    the same code path — same process, same collection handle, same error
+    mapping — as the inline call it replaces. ``file_lock`` is threaded to the
+    miners so the worker can hold the hub's write lock per source file.
+    """
+    global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning, MineValidationError
+
     def _run():
         if mode == "convos":
             from .convo_miner import mine_convos
@@ -3834,6 +4060,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                file_lock=file_lock,
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -3845,6 +4072,7 @@ def tool_mine(
                 agent=agent,
                 limit=limit,
                 dry_run=dry_run,
+                file_lock=file_lock,
             )
         from .miner import mine
 
@@ -3855,6 +4083,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            file_lock=file_lock,
         )
 
     try:
@@ -5927,9 +6156,12 @@ TOOLS = {
             "mode='convos' also accepts a single conversation file. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
-            "the mempalace[extract] extra). Runs synchronously and returns the miner's "
-            "summary as `output`. The palace write lock is automatic; a concurrent mine "
-            "returns a structured already-running error. Orphan cleanup is separate — use "
+            "the mempalace[extract] extra). On a shared HTTP hub the mine is queued as a "
+            "background job and this returns immediately with {queued: true, job_id, "
+            "position}; follow it in mempalace_status.mine_queue. Elsewhere (and with "
+            "wait=true) it runs synchronously and returns the miner's summary as `output`. "
+            "A repeat request for the same source/mode/wing returns the job already queued "
+            "instead of stacking a second one. Orphan cleanup is separate — use "
             "mempalace_sync."
         ),
         "input_schema": {
@@ -5969,6 +6201,21 @@ TOOLS = {
                     "description": (
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
+                    ),
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": (
+                        "Block until the queued job finishes and return the miner's "
+                        "summary (the pre-queue contract). Default: false."
+                    ),
+                },
+                "wait_timeout": {
+                    "type": "number",
+                    "description": (
+                        "Seconds to wait when wait=true (default "
+                        "MEMPALACE_MCP_MINE_WAIT_SECS, 600). On timeout the job keeps "
+                        "running and its job_id is returned."
                     ),
                 },
             },
@@ -7185,6 +7432,9 @@ def _decorate_mcp_tool_result(tool_name: str, result):
         from .update_awareness import cached_update_status, schedule_update_check
 
         result.setdefault("writer", _writer_mode())
+        # Operators need to see the hub's mine backlog somewhere they already
+        # look; a queue nobody can inspect is how a stuck worker goes unnoticed.
+        result.setdefault("mine_queue", _mine_queue_status())
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
         result.setdefault("updates", {"server": cached_update_status()})
@@ -7642,15 +7892,33 @@ def _append_watchdog_journal(tool_name: str, elapsed: float, palace_path: str = 
 
 
 @contextlib.contextmanager
-def _write_stall_watch(tool_name: str):
-    """Register a vector write as in flight for the stall watchdog."""
+def _write_stall_watch(tool_name: str, *, force: bool = False):
+    """Register a vector write as in flight for the stall watchdog.
+
+    ``force=True`` arms the watch for a label that is not a tool name — the
+    hub's mine worker uses it to arm one watch per *source file*. That is what
+    keeps the watchdog honest after mining went asynchronous: it measures a
+    single per-file hold, so a wedged chromadb write still trips the exit
+    limit, while a three-minute job that is steadily finishing files never
+    accumulates one long "elapsed".
+
+    Conversely, when the hub's queue is live ``mempalace_mine`` itself is
+    *not* watched here: the dispatch call only enqueues (nothing to stall),
+    and under ``wait=True`` it is blocked on another thread's work, which is
+    waiting, not stalling.
+    """
     global _write_stall_inflight
 
-    if tool_name not in _VECTOR_WRITE_TOOLS:
-        yield
-        return
+    if not force:
+        if tool_name not in _VECTOR_WRITE_TOOLS:
+            yield
+            return
+        if tool_name == "mempalace_mine" and _MINE_QUEUE is not None:
+            yield
+            return
 
     with _write_stall_lock:
+        previous = _write_stall_inflight
         _write_stall_inflight = {
             "tool": tool_name,
             "since": time.monotonic(),
@@ -7659,8 +7927,11 @@ def _write_stall_watch(tool_name: str):
     try:
         yield
     finally:
+        # Restore rather than clear: watches never actually nest today (the
+        # exclusive lock serializes them), but a restore cannot leave a real
+        # in-flight write unwatched if that ever changes.
         with _write_stall_lock:
-            _write_stall_inflight = None
+            _write_stall_inflight = previous
 
 
 def _start_write_stall_watchdog() -> None:
@@ -8096,6 +8367,7 @@ def _http_status_payload(httpd) -> dict:
             "sqlite_integrity": integrity,
         },
         "writer": writer,
+        "mine_queue": _mine_queue_status(),
         "requests": {
             "total": request_count,
             "by_status": status_counts,
@@ -8152,6 +8424,15 @@ def _http_dispatch(request):
     if method == "tools/call" and isinstance(request.get("params"), dict):
         tool_name = request["params"].get("name")
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        return handle_request(request)
+    # With the background queue live, mempalace_mine takes no palace lock on
+    # this thread: it enqueues (or waits on the worker). Dispatching it under
+    # the exclusive lock would deadlock wait=True against the worker's own
+    # per-file acquisition, and would re-serialize the enqueue behind whatever
+    # file the worker is on. The mine's palace access is locked per file
+    # inside _hub_mine_file_lock instead — including for dry runs, which the
+    # queue runs inline on this thread with the same per-file lock.
+    if tool_name == "mempalace_mine" and _MINE_QUEUE is not None:
         return handle_request(request)
     # service.classify_tool is the authoritative read/write registry. The
     # lock-free set above is a storage-boundary override for independent DBs.
@@ -9409,6 +9690,11 @@ def _run_http_loop() -> None:
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
         _start_write_stall_watchdog()
+        # Mines become background jobs here, and only here: the hub is the
+        # process that holds the writer lease for its lifetime, so it is the
+        # only one that can run a forwarded mine at all — and the only one
+        # where an inline mine takes the whole palace down with it.
+        _start_mine_queue()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
         if raw_warmup in _WARMUP_TRUTHY:
@@ -9428,6 +9714,9 @@ def _run_http_loop() -> None:
 
         _serve_http(_args.host, _args.port)
     finally:
+        # Before the lease: a mine worker must not be writing into a palace
+        # this process is about to hand back.
+        _stop_mine_queue()
         if owns_writer_lease:
             # _serve_http uses daemon request threads, so synchronize with the
             # dispatch lock before closing storage and exposing the palace to
