@@ -34,7 +34,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .config import MempalaceConfig
 
 from .sources.codex import (
     ADAPTER_VERSION,
@@ -91,6 +94,23 @@ def _palace_state_key(palace_path: str) -> str:
     return os.path.normcase(os.path.realpath(os.path.expanduser(palace_path)))
 
 
+# Cached like mcp_server's module-level ``_config`` -- read config.json from
+# disk once per process rather than on every hub-unavailable pass. A follower
+# process is long-lived (``follow()`` loops on a fixed interval), so at a
+# 15s+ cadence a fresh ``MempalaceConfig()`` per failing pass would mean a
+# gratuitous disk stat for every pass a hub stays down.
+_config_cache: Optional[MempalaceConfig] = None
+
+
+def _get_config() -> MempalaceConfig:
+    global _config_cache
+    if _config_cache is None:
+        from .config import MempalaceConfig
+
+        _config_cache = MempalaceConfig()
+    return _config_cache
+
+
 def _hub_grace_window_secs() -> float:
     """Seconds to hold a pass for a vanished hub before resuming direct writes.
 
@@ -114,9 +134,7 @@ def _hub_grace_window_secs() -> float:
     if from_env is not None:
         return from_env
     try:
-        from .config import MempalaceConfig
-
-        configured = MempalaceConfig().hub_grace_secs
+        configured = _get_config().hub_grace_secs
     except Exception:
         configured = None
     from_config = _parse("" if configured is None else str(configured), "hub.grace_secs")

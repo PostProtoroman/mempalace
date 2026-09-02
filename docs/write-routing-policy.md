@@ -140,6 +140,15 @@ index state between calls.
   to lose by letting them through — stalling them would take agent
   coordination down for the whole window. `codex_capture` mutates the palace
   and stays held.
+- The Codex follower (`mempalace/codex_follower.py`, `mempalace codex-capture`)
+  is a third component in the same lane: it always tries the hub first, and a
+  pass that finds the hub unreachable but has seen it own this palace within
+  `MEMPALACE_HUB_GRACE_SECS` holds — writes nothing, takes no lock — instead
+  of racing the restarting hub for its own lease. Like MCP stdio, its direct
+  writes are per-pass, not held for the process lifetime: each pass opens the
+  palace lock, writes, closes its storage handles in a `finally`, and releases
+  the lock before the next pass's sleep, so a peer (including a hub coming
+  back up) can always take the lease between passes.
 - Both `-32001` conditions carry a `condition` field in `error.data`:
   `peer_writer_active` for a peer holding the lease, `hub_restarting` for the
   grace-window hold. Both are retryable.

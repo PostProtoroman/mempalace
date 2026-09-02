@@ -1390,6 +1390,15 @@ def cmd_codex_capture(args):
         if stats.get("error"):
             print(f"  Capture failed via {stats.get('writer')}: {stats['error']}", file=sys.stderr)
             return 1
+        if stats.get("held_for_hub_restart"):
+            # Nothing was written: the pass held instead of racing a
+            # restarting hub for the palace writer lease. "Wrote via hold:
+            # +0 new" would misreport a no-op pass as a completed write.
+            print(
+                "  Held: hub restarting, nothing written this pass "
+                "(turns are still queued for the next capture)."
+            )
+            return 0
         print(
             f"  Wrote via {stats.get('writer')}: +{stats['drawers_added']} new, "
             f"{stats['drawers_already_present']} already present."

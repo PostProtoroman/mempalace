@@ -147,6 +147,8 @@ Delete a drawer by ID. Irreversible.
 
 Capture Codex CLI session turns into the palace from inside the hub. Exists so the Codex capture follower never competes for the palace writer lease: a hub holds that lease for its whole lifetime, so a follower writing directly would be refused on exactly the machines a hub runs on, and capture would stop silently. Handing the work to the lease holder keeps a single writer.
 
+When no hub is reachable the follower falls back to writing directly, but only per-pass: it takes the palace lock, writes, closes its storage handles, and releases the lock before its next sleep — the same close-handles-before-release discipline as MCP stdio's per-call hold (see `docs/write-routing-policy.md`). During a hub restart specifically, a follower that has seen this palace's hub before holds (writes nothing, takes no lock) for `MEMPALACE_HUB_GRACE_SECS` instead of racing the restarting hub for the lease.
+
 Bounded by `max_turns` so a first-time scan of a large corpus cannot park the hub's write path; repeat the call while the response has `pending: true`.
 
 Machine sessions are guarded: a session whose `thread_source` is `subagent` or `guardian_review` is routed to the dedicated `codex_subagents` wing (with `parent_thread_id` in its metadata), never to the wing the user's own conversations land in. Non-interactive `codex exec` sessions (`originator: codex_exec`) are skipped entirely unless `include_automation` is true, in which case they go to the dedicated `codex_automation` wing. A rollout the parser yields no messages for is never ingested as raw text — it is counted in `files_unparseable` and named in a warning log line.

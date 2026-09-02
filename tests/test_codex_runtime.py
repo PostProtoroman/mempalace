@@ -332,6 +332,13 @@ def test_consecutive_failures_escalate_to_error_and_one_event(tmp_path, monkeypa
     assert errors, "threshold crossing must log at ERROR, not lower"
     assert any("consecutive failed passes" in r.getMessage() for r in errors)
 
+    events = _outage_events(palace)
+    assert len(events) == 1, "one status event per outage, not per pass"
+    event = events[0]
+    assert event["to_agent"] == "*"
+    assert "mempalace_codex_capture" in event["body"]
+    assert "HTTP 500" in event["body"]
+
 
 # ── hub restart grace window ─────────────────────────────────────────
 #
@@ -618,9 +625,19 @@ class TestPerPassLeaseScoping:
             "mempalace.codex_hub.capture_via_hub",
             _throw(codex_hub.HubUnavailable("no hub")),
         )
+
+        def _open_then_boom(palace_path, *a, **k):
+            # Open (and thus cache) a client before failing, so this test
+            # actually exercises the ``finally`` handle-close path rather
+            # than passing vacuously because no client was ever opened.
+            from mempalace.palace import get_collection
+
+            get_collection(palace_path, create=True)
+            raise RuntimeError("boom")
+
         monkeypatch.setattr(
             "mempalace.codex_follower.scan_once",
-            _throw(RuntimeError("boom")),
+            _open_then_boom,
         )
 
         with pytest.raises(RuntimeError):
@@ -666,13 +683,11 @@ def test_hold_does_not_reset_an_in_progress_failure_streak(tmp_path, monkeypatch
 
     hb = read_heartbeat(palace)
     assert hb["consecutive_failures"] == 4
-
-    events = _outage_events(palace)
-    assert len(events) == 1, "one status event per outage, not per pass"
-    event = events[0]
-    assert event["to_agent"] == "*"
-    assert "mempalace_codex_capture" in event["body"]
-    assert "HTTP 500" in event["body"]
+    # A hold in the middle of the streak must not reset the count back to
+    # zero -- it stays neutral, so the two failures on either side of it
+    # still add up to a continuous streak of 4 (crossing ESCALATION_THRESHOLD)
+    # rather than two separate, sub-threshold streaks of 2.
+    assert hb["outage_announced"] is True, "hold-interrupted streak still crosses the threshold"
 
 
 def test_failures_below_threshold_do_not_announce(tmp_path, monkeypatch):
