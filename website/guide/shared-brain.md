@@ -454,6 +454,15 @@ The same non-negotiables that govern memory govern coordination:
   agent refresh its tools, and when one reports a tool "missing", make it
   state the exact set it can see — a stale client cache looks identical to
   a hub problem otherwise.
+- **Hub restarts and retries**: when a hub restarts and briefly drops off the
+  network, stdio and embedded servers see a new `-32001` error with
+  `data.retryable: true` instead of falling back to direct writes. If a write
+  returns hub-restarting, retry — the hub is likely coming back. The grace
+  window (`MEMPALACE_HUB_GRACE_SECS`, default 60 seconds) is measured from
+  the first detection of an outage, so even an idle session still protects a
+  hub restarting now. After the grace window expires, direct writes resume.
+  Reads never block on hub outages — the local fallback serves them
+  immediately.
 - **Debug connections outside the agent first**: when a remote agent can't
   reach the hub, check `healthz` (no token) and then an authenticated
   `mempalace_status` from a plain `curl` before touching any agent config.

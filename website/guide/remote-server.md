@@ -197,16 +197,31 @@ messages between machines.
 - **One writer-lease per process**: a single `mempalace-mcp --transport http`
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
-- **Degraded startup**: when another process (a session's stdio server, a
-  direct CLI mine) already holds the palace writer lease, a writable HTTP
-  server still starts — in *degraded* mode. Logstream tools, reads that need
-  no writer lease, and `/healthz` all work; palace write tools return a
-  structured retryable error naming the lease holder. The server retries the
-  lease in the background (`MEMPALACE_MCP_LEASE_RETRY_SECS`, default 15s,
-  clamped 1–300) and promotes itself to full mode when it wins, logging both
-  transitions. `/statusz` and `mempalace_status` expose
-  `writer.mode: "degraded" | "full"` plus holder info, so a supervisor can
-  tell "waiting for the lease" apart from "down".
+- **Degraded startup and hub restarts**: when another process (a session's
+  stdio server, a direct CLI mine) already holds the palace writer lease, a
+  writable HTTP server still starts — in *degraded* mode. Logstream tools,
+  reads that need no writer lease, and `/healthz` all work; palace write tools
+  return a structured retryable error naming the lease holder. The server
+  retries the lease in the background (`MEMPALACE_MCP_LEASE_RETRY_SECS`,
+  default 15s, clamped 1–300) and promotes itself to full mode when it wins,
+  logging both transitions. `/statusz` and `mempalace_status` expose
+  `writer.mode: "degraded" | "full"` plus `lease_scope` (`"lifetime"` for HTTP,
+  `"per_call"` for stdio) and holder info, so a supervisor can tell "waiting
+  for the lease" apart from "down".
+  
+  When a hub restarts and briefly drops off the network, stdio and embedded
+  servers see a new `-32001` error (`palace hub restarting — retry`) with
+  `data.retryable: true` instead of falling back to direct writes. Within the
+  grace window (`MEMPALACE_HUB_GRACE_SECS`, default 60 seconds), callers
+  should retry — the hub is likely coming back. The grace window is measured
+  from the *first detection* of an outage, so even a session idle for an hour
+  still protects a hub restarting now. After the grace window expires, direct
+  writes resume. Set `MEMPALACE_HUB_GRACE_SECS=0` to disable the grace hold
+  and restore the pre-change behavior (direct writes during an outage).
+  Reads are never blocked by hub outages — the local palace fallback
+  (`mode=ro`, `query_only`) serves them immediately. Set
+  `MEMPALACE_HUB_FORWARD=0` to disable hub proxying entirely (the kill switch
+  also disables the grace hold).
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
   works as a load-balancer/Kubernetes liveness probe. For machine-readable
   server state, `GET /statusz` returns JSON with version, uptime, request

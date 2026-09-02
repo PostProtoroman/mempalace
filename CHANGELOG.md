@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Writer-lease scope is now per-call for stdio and embedded servers.** The HTTP hub (`mempalace serve`) holds the palace writer lease for its full lifetime (unchanged), but stdio MCP servers and embedded clients now acquire and release the lease for each mutating call instead of for the whole session. This protects the palace during a hub restart: when a hub goes away and comes back, stdio calls see a new `-32001` error (`palace hub restarting — retry`) with `data.retryable: true` instead of falling back to direct writes that would corrupt a restarting hub's file state. The grace window (`MEMPALACE_HUB_GRACE_SECS`, default 60 seconds, clamped 0–3600) gives the hub time to recover; after it expires, direct writes resume. Reads are unaffected — the local palace fallback (`mode=ro`, `query_only`) serves them immediately during an outage. Set `MEMPALACE_HUB_GRACE_SECS=0` to restore pre-change behavior (no grace hold), or `MEMPALACE_HUB_FORWARD=0` to disable hub proxying entirely (also disables the grace hold). Sessions no longer need to be killed to restart a hub.
+
+### Documentation
+
+- **Writer-lease and hub-restart behavior in deployment and shared-brain guides.** Updated `website/guide/remote-server.md` to document the grace window, `-32001` error, and lease scope distinction; added one paragraph to `website/guide/shared-brain.md` stating "if a write returns hub-restarting, retry"; added a hub restart runbook to `deploy/launchd/README.md` noting that sessions do not need to be killed.
+
 ## [3.10.0] — 2026-09-02
 
 Secrets stop landing in the palace, agents get a one-command health check and a safety net for backup/restore, Codex sessions are captured automatically, and a hub degrades instead of dying when another peer holds the writer lease.
