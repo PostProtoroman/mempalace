@@ -55,6 +55,18 @@ programmatically (pinning the exact interpreter it is run from); these
 templates exist for reviewable, repo-tracked deployments of both jobs from a
 canonical checkout.
 
+## Hub restart runbook
+
+When restarting the hub (`launchctl bootout gui/$(id -u)/ai.mempalace.hub`
+then `launchctl bootstrap gui/$(id -u)/ ~/Library/LaunchAgents/ai.mempalace.hub.plist`),
+sessions do **not** need to be killed. The hub's writer lease is now per-call
+scoped, so stdio and embedded servers can handle the restart gracefully without
+holding the palace hostage. When the hub drops off the network, mutating calls
+see a `-32001` error with `data.retryable: true` and a grace window that gives
+the hub 60 seconds to come back (`MEMPALACE_HUB_GRACE_SECS`); reads fall back
+to the local palace immediately. Restart the hub, and active sessions reconnect
+on their next call — no reconfiguration, no manual intervention needed.
+
 ## Scheduled `mempalace backup`
 
 `deploy/launchd/ai.mempalace.backup.plist` runs `mempalace backup` daily at
