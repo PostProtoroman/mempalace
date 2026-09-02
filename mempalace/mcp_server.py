@@ -1004,7 +1004,12 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
 
-    ok, reason = _acquire_mcp_writer_lock()
+    # Under the same guard the scoped lease uses: two threads reaching
+    # preflight from a cold _MCP_WRITER_LOCK_CM could otherwise both call
+    # mine_palace_lock, and the loser's pass-through cm could win the
+    # assignment — orphaning the real flock for the life of the process.
+    with _MCP_WRITER_LEASE_GUARD:
+        ok, reason = _acquire_mcp_writer_lock()
     if ok:
         return None
 
@@ -1051,7 +1056,14 @@ def _mcp_scoped_writer_lease(tool_name: str):
 
     with _MCP_WRITER_LEASE_GUARD:
         _MCP_WRITER_LEASE_DEPTH += 1
-        ok, reason = _acquire_mcp_writer_lock()
+        try:
+            ok, reason = _acquire_mcp_writer_lock()
+        except BaseException:
+            # Keep the counter balanced even if acquisition itself blows up
+            # (e.g. an import failure inside it); an unbalanced depth would
+            # pin the lease for the rest of the process.
+            _MCP_WRITER_LEASE_DEPTH -= 1
+            raise
         if not ok:
             _MCP_WRITER_LEASE_DEPTH -= 1
     if not ok:

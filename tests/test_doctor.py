@@ -660,6 +660,9 @@ class TestRogueLeaseHolder:
         monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(shutil, "which", lambda name: "/bin/launchctl")
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+        # os.getuid does not exist on Windows; keep the launchctl-parsing
+        # coverage on every CI platform instead of skipping it.
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
 
         assert doctor._hub_launchd_pid() == 8905
 
@@ -674,6 +677,9 @@ class TestRogueLeaseHolder:
         monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(shutil, "which", lambda name: "/bin/launchctl")
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+        # os.getuid does not exist on Windows; keep the launchctl-parsing
+        # coverage on every CI platform instead of skipping it.
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
 
         assert doctor._hub_launchd_pid() is None
 
