@@ -1106,7 +1106,17 @@ def _maybe_reap_stale_mine_locks() -> None:
 
 
 class MineAlreadyRunning(RuntimeError):
-    """Raised when another `mempalace mine` already holds the per-palace lock."""
+    """Raised when another `mempalace mine` already holds the per-palace lock.
+
+    ``holder_pid`` carries the pid recorded in the lock file's identity body
+    when it could be parsed, and ``None`` otherwise. Callers that cache the
+    refusal (the MCP writer-lease status flags) use it to tell "the holder is
+    still alive" apart from "the holder exited and this refusal is stale" —
+    the exact difference between a hub that owns the palace and a hub that is
+    mid-restart.
+    """
+
+    holder_pid = None
 
 
 class MineValidationError(RuntimeError):
@@ -1256,8 +1266,13 @@ def _format_lock_holder(content: str) -> str:
 _LOCK_SENTINEL_BYTES = 1
 
 
-def _read_lock_holder(lock_file) -> str:
-    """Read the prior holder's identity from the lock-file body, best-effort."""
+def _read_lock_holder_record(lock_file) -> tuple:
+    """Read the prior holder's identity as ``(description, pid_or_None)``.
+
+    The pid is what makes a cached refusal falsifiable later: a process that
+    exited cannot still own the flock, so a stale "another writer holds the
+    palace" flag can be recognized as stale without re-taking the lock.
+    """
     try:
         lock_file.seek(_LOCK_SENTINEL_BYTES)
         content = lock_file.read()
@@ -1265,10 +1280,17 @@ def _read_lock_holder(lock_file) -> str:
             content = content.decode("utf-8", errors="replace")
         content = content.strip()
     except OSError:
-        return "another writer (identity not recorded)"
+        return "another writer (identity not recorded)", None
     if not content:
-        return "another writer (identity not recorded)"
-    return _format_lock_holder(content)
+        return "another writer (identity not recorded)", None
+    first = content.split(maxsplit=1)[0]
+    pid = int(first) if first.isdigit() else None
+    return _format_lock_holder(content), pid
+
+
+def _read_lock_holder(lock_file) -> str:
+    """Read the prior holder's identity from the lock-file body, best-effort."""
+    return _read_lock_holder_record(lock_file)[0]
 
 
 def _write_lock_holder(lock_file) -> None:
@@ -1362,11 +1384,13 @@ def mine_palace_lock(palace_path: str):
                 msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
                 acquired = True
             except OSError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
+                holder, holder_pid = _read_lock_holder_record(lf)
+                busy = MineAlreadyRunning(
                     f"palace {resolved} is held by {holder}; "
                     "wait for it to finish or stop the holder before retrying"
-                ) from exc
+                )
+                busy.holder_pid = holder_pid
+                raise busy from exc
         else:
             import fcntl
 
@@ -1374,11 +1398,13 @@ def mine_palace_lock(palace_path: str):
                 fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
             except BlockingIOError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
+                holder, holder_pid = _read_lock_holder_record(lf)
+                busy = MineAlreadyRunning(
                     f"palace {resolved} is held by {holder}; "
                     "wait for it to finish or stop the holder before retrying"
-                ) from exc
+                )
+                busy.holder_pid = holder_pid
+                raise busy from exc
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)
         # Mark the hold from inside the try so it always pairs with

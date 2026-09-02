@@ -898,6 +898,30 @@ class MempalaceConfig:
         return DEFAULT_BACKEND
 
     @property
+    def hub_grace_secs(self):
+        """Seconds a stdio server waits for a vanished palace hub before writing direct.
+
+        Read from ``config.json``'s ``hub.grace_secs``; ``None`` when unset, so
+        the MCP server applies its own default. ``MEMPALACE_HUB_GRACE_SECS``
+        takes precedence and is read there, next to the clamp — this property
+        is only the file half.
+
+        The window exists because the hub holds the palace writer lease for its
+        lifetime: during a hub restart a direct write from a session server
+        would grab that lease and leave the returning hub degraded.
+        """
+        value = self._file_config.get("hub", {})
+        if not isinstance(value, dict):
+            return None
+        raw = value.get("grace_secs")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def qdrant_url(self):
         """Qdrant endpoint for the opt-in ``qdrant`` backend.
 

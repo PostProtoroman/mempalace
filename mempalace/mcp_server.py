@@ -413,18 +413,50 @@ _STARTUP_INTEGRITY_MAX_MB_ENV = "MEMPALACE_STARTUP_INTEGRITY_MAX_MB"
 _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 
 
-# MCP peer-writer guard (#1818).
+# MCP peer-writer guard (#1818) and its lease *scope*.
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
-# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
-# lifetime. A peer MCP process can still serve read tools, but mutating tools
-# refuse before touching Chroma or the knowledge graph.
+# HNSW/FTS state, so a writer must own the per-palace mine lock across the whole
+# interval in which its storage handles are open. Who "the writer" is depends on
+# the transport, and that is what the lease scope encodes:
+#
+#   "lifetime"  the writable HTTP hub. It is the designated single writer for
+#               the palace, keeps its storage handles hot, and therefore holds
+#               the flock from startup (or from background promotion) until it
+#               exits. Unchanged behaviour.
+#
+#   "per_call"  every stdio / embedded server, i.e. the per-session servers an
+#               agent harness spawns. These acquire the flock for the duration
+#               of ONE mutating tool call and release it immediately after,
+#               dropping their writable storage handles on the way out (see
+#               _release_mcp_writer_lock -> _discard_mcp_storage_handles), which
+#               is what makes releasing safe.
+#
+# Why per-call for stdio: the hub holds the flock for its lifetime, so during a
+# hub restart (watchdog exit 75 + KeepAlive, or an operator bootout) the flock
+# is briefly free. A session stdio server that took a mutating call in that
+# window used to grab the flock lazily and hold it for its own lifetime —
+# hours — leaving the restarted hub permanently degraded and every hub-routed
+# writer (codex capture) blocked. Observed live 2026-09-01 x2, 2026-09-02 x1.
+# Per-call scoping bounds that theft to a single call.
+_LEASE_SCOPE_LIFETIME = "lifetime"
+_LEASE_SCOPE_PER_CALL = "per_call"
+_MCP_WRITER_LEASE_SCOPE = _LEASE_SCOPE_PER_CALL
+# Nesting depth of active per-call leases, so a threaded host cannot release
+# the flock out from under a concurrent mutating call (mine_palace_lock is
+# re-entrant per process, so the inner acquire is a passthrough).
+_MCP_WRITER_LEASE_DEPTH = 0
+_MCP_WRITER_LEASE_GUARD = threading.Lock()
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_LOCK_HOLDER = ""
+# pid of the peer that refused us the lease, when the lock file recorded one.
+# A refusal whose holder has since exited is provably stale; _writer_mode()
+# uses this instead of reporting "degraded" forever off a cached flag.
+_MCP_WRITER_LOCK_HOLDER_PID = None
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 # Degraded-mode background lease retry (bounded interval, seconds).
@@ -713,7 +745,14 @@ def _discard_mcp_storage_handles() -> None:
 
 
 def _release_mcp_writer_lock() -> None:
-    """Close writable handles and release this process's palace lease."""
+    """Close writable handles and release this process's palace lease.
+
+    Dropping the storage handles first is what makes a *repeated* release safe:
+    a per-call lease that gave back the flock while keeping a Chroma
+    PersistentClient open would re-enter the stale-HNSW/FTS hazard the lease
+    exists to prevent. The next mutating call reopens writable storage under a
+    freshly acquired lease.
+    """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
 
@@ -747,10 +786,16 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
     neither short-circuits a later retry. Peer ownership and transient setup
     failures can both be corrected without restarting the MCP host.
+
+    How long the lease is *kept* is the caller's business, not this function's:
+    the writable HTTP hub holds it for its lifetime, while stdio and embedded
+    servers give it back at the end of the call via
+    ``_mcp_scoped_writer_lease`` (see ``_MCP_WRITER_LEASE_SCOPE``).
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
     global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_LOCK_HOLDER, _MCP_WRITER_ATEXIT_REGISTERED
+    global _MCP_WRITER_LOCK_HOLDER_PID
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
@@ -783,6 +828,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
         _MCP_WRITER_LOCK_HOLDER = str(exc)
+        _MCP_WRITER_LOCK_HOLDER_PID = getattr(exc, "holder_pid", None)
         _MCP_WRITER_LOCK_ERROR = (
             "another mempalace writer already holds the palace lock for "
             f"{_config.palace_path!r}: {exc}"
@@ -813,7 +859,35 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
     _MCP_WRITER_LOCK_HOLDER = ""
+    _MCP_WRITER_LOCK_HOLDER_PID = None
     return True, ""
+
+
+def _writer_lease_scope() -> str:
+    """``lifetime`` for the writable HTTP hub, ``per_call`` everywhere else."""
+    return _MCP_WRITER_LEASE_SCOPE
+
+
+def _peer_writer_refusal_is_stale() -> bool:
+    """True when the peer named by the last refusal has since exited.
+
+    Under per-call scoping a stdio server holds no lease between calls, so the
+    only thing ``_MCP_WRITER_READ_ONLY`` can honestly assert is "the last
+    acquisition attempt lost to *that* process". Once that pid is gone the
+    claim is false, and reporting ``degraded`` off it would be exactly the
+    stale flag this rework exists to remove. Unknown pid -> not provably
+    stale, so the flag stands.
+    """
+    pid = _MCP_WRITER_LOCK_HOLDER_PID
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        from . import server_registry
+
+        return not server_registry._pid_alive(pid)
+    except Exception:
+        logger.debug("writer-lease holder liveness probe failed", exc_info=True)
+        return False
 
 
 def _writer_mode() -> dict:
@@ -821,11 +895,18 @@ def _writer_mode() -> dict:
 
     ``degraded`` means: a peer holds the palace writer lease, so palace write
     tools return a structured retryable error while logstream tools, reads,
-    and /healthz keep working. ``full`` is normal operation (including a
-    stdio server that simply has not needed the lease yet).
+    and /healthz keep working. ``full`` is normal operation.
+
+    Under ``per_call`` scope, *not holding the flock right now* is the normal
+    resting state and is reported as ``full`` — the lease is taken and given
+    back around each mutating call. Only a live peer that actually refused us
+    is ``degraded``, and the refusal is re-checked against the holder's
+    liveness so a hub that has since restarted does not leave this server
+    reporting a peer that no longer exists.
     """
-    payload = {"mode": "degraded" if _MCP_WRITER_READ_ONLY else "full"}
-    if _MCP_WRITER_READ_ONLY and _MCP_WRITER_LOCK_HOLDER:
+    degraded = _MCP_WRITER_READ_ONLY and not _peer_writer_refusal_is_stale()
+    payload = {"mode": "degraded" if degraded else "full"}
+    if degraded and _MCP_WRITER_LOCK_HOLDER:
         payload["holder"] = _MCP_WRITER_LOCK_HOLDER
     return payload
 
@@ -901,6 +982,51 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
             },
         },
     }
+
+
+@contextlib.contextmanager
+def _mcp_scoped_writer_lease(tool_name: str):
+    """Bound this process's writer lease to one mutating tool call.
+
+    The lease is *acquired* by ``_mcp_peer_writer_refusal`` during preflight
+    (that is where a refusal has to be produced). This context manager owns
+    the other half: under ``per_call`` scope it releases the flock — and the
+    writable storage handles taken under it — as soon as the handler returns,
+    success or exception.
+
+    Nested/concurrent mutating calls in one process are counted, so an inner
+    call (or a second worker thread in an embedded host) cannot release the
+    flock while an outer call is still writing; ``mine_palace_lock`` itself
+    stays re-entrant, so a ``mine`` inside a tool is unaffected.
+
+    ``lifetime`` scope (the writable HTTP hub) is a deliberate no-op: the hub
+    is the designated writer, keeps its storage handles hot, and must not
+    hand the palace to a racing session server between requests.
+    """
+
+    global _MCP_WRITER_LEASE_DEPTH
+
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
+        yield
+        return
+
+    with _MCP_WRITER_LEASE_GUARD:
+        _MCP_WRITER_LEASE_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _MCP_WRITER_LEASE_GUARD:
+            _MCP_WRITER_LEASE_DEPTH -= 1
+            release = _MCP_WRITER_LEASE_DEPTH <= 0 and (
+                _writer_lease_scope() == _LEASE_SCOPE_PER_CALL
+            )
+        if release:
+            try:
+                _release_mcp_writer_lock()
+            except Exception:
+                # A failed release must not replace the tool's own result or
+                # error. The OS still frees the flock when this process dies.
+                logger.warning("Failed to release per-call palace writer lease", exc_info=True)
 
 
 def _startup_integrity_size_limit_bytes() -> int:
@@ -7146,7 +7272,10 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            with _write_stall_watch(tool_name):
+            # The writer lease was acquired in preflight; this scopes it to the
+            # call under per_call scope (stdio/embedded) and leaves the hub's
+            # lifetime hold alone.
+            with _mcp_scoped_writer_lease(tool_name), _write_stall_watch(tool_name):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
@@ -7866,6 +7995,9 @@ def _http_status_payload(httpd) -> dict:
         "read_only": _READ_ONLY,
         "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
         "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+        # "lifetime" for this hub; a session stdio server reports "per_call".
+        "lease_scope": _writer_lease_scope(),
+        "lease_held": _MCP_WRITER_LOCK_CM is not None,
         **_writer_mode(),
     }
     if _MCP_WRITER_LOCK_ERROR:
@@ -8764,6 +8896,134 @@ _HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
 _HUB_PROXY_TIMEOUT_S = 600.0
 _hub_proxy_announced = False
 
+# Hub restart grace window.
+#
+# A hub restart (watchdog exit 75 + KeepAlive, an operator bootout) removes the
+# serverinfo record for a few seconds. Without a grace window the very next
+# mutating call sees "no hub", falls back to direct, and takes the palace flock
+# the restarting hub is about to want — the outage this lane closes. So: once
+# this process has seen a hub own the palace, a mutating call that finds it
+# missing gets a structured *retryable* error for the first N seconds of the
+# outage instead of a direct write. Reads keep falling back immediately: they
+# take no lease and a read served locally is strictly better than an error.
+# After N seconds with no hub, the hub is treated as genuinely gone and direct
+# mode resumes (now per-call lease scoped, so it can no longer strand a hub).
+_HUB_GRACE_SECS_ENV = "MEMPALACE_HUB_GRACE_SECS"
+_HUB_GRACE_SECS_DEFAULT = 60.0
+_HUB_GRACE_SECS_MAX = 3600.0
+# monotonic of the last time a hub was observed serving this palace (a
+# successful forward, or a live serverinfo record — a pid-liveness probe).
+_hub_last_seen_monotonic = None
+# monotonic of the first observation of the *current* outage, or None when a
+# hub is present. The window is measured from here, not from last-seen, so an
+# idle session that forwarded an hour ago still protects a hub restarting now.
+_hub_unavailable_since = None
+
+
+def _hub_grace_window_secs() -> float:
+    """Seconds to wait for a vanished hub before resuming direct writes.
+
+    ``MEMPALACE_HUB_GRACE_SECS`` first, then ``hub.grace_secs`` in
+    config.json, then 60. Clamped to 0..3600; 0 disables the window (immediate
+    direct fallback, the pre-#2214 behaviour).
+    """
+    raw = os.environ.get(_HUB_GRACE_SECS_ENV, "").strip()
+    if not raw:
+        try:
+            configured = getattr(_config, "hub_grace_secs", None)
+        except Exception:
+            configured = None
+        raw = "" if configured is None else str(configured).strip()
+    if not raw:
+        return _HUB_GRACE_SECS_DEFAULT
+    try:
+        secs = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0fs",
+            _HUB_GRACE_SECS_ENV,
+            raw,
+            _HUB_GRACE_SECS_DEFAULT,
+        )
+        return _HUB_GRACE_SECS_DEFAULT
+    return min(_HUB_GRACE_SECS_MAX, max(0.0, secs))
+
+
+def _note_hub_seen() -> None:
+    """Record proof that a hub answered: a forward completed, or it returned HTTP."""
+    global _hub_last_seen_monotonic, _hub_unavailable_since
+    _hub_last_seen_monotonic = time.monotonic()
+    _hub_unavailable_since = None
+
+
+def _note_hub_record() -> None:
+    """Record a live serverinfo record: a hub owns this palace, reachability unknown.
+
+    Weaker than :func:`_note_hub_seen` on purpose. It establishes "this palace
+    has a hub" (so a later disappearance earns a grace window) without
+    clearing an outage in progress — otherwise a hub whose pid is alive but
+    whose port is dead would reset its own outage clock on every request and
+    the window could never expire.
+    """
+    global _hub_last_seen_monotonic
+    if _hub_last_seen_monotonic is None:
+        _hub_last_seen_monotonic = time.monotonic()
+
+
+def _note_hub_missing() -> None:
+    """Record the start of an outage, but only for a hub we have actually seen."""
+    global _hub_unavailable_since
+    if _hub_last_seen_monotonic is None:
+        return
+    if _hub_unavailable_since is None:
+        _hub_unavailable_since = time.monotonic()
+
+
+def _hub_grace_active() -> bool:
+    """True while a previously-seen hub has been missing for less than the window."""
+    if _hub_last_seen_monotonic is None or _hub_unavailable_since is None:
+        return False
+    window = _hub_grace_window_secs()
+    if window <= 0:
+        return False
+    return (time.monotonic() - _hub_unavailable_since) < window
+
+
+def _hub_restarting_error(request: dict):
+    """Structured retryable error for a mutating call during a hub restart."""
+    if request.get("id") is None:
+        return None
+    window = _hub_grace_window_secs()
+    waited = 0.0
+    if _hub_unavailable_since is not None:
+        waited = max(0.0, time.monotonic() - _hub_unavailable_since)
+    return {
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "error": {
+            "code": -32001,
+            "message": "palace hub restarting — retry",
+            "data": {
+                "tool": ((request.get("params") or {}).get("name")) or "",
+                "palace": getattr(_config, "palace_path", ""),
+                "retryable": True,
+                "reason": (
+                    "The palace hub that owns this palace is not answering "
+                    "right now (restart in progress). This mutating call is "
+                    "not being written directly, because a direct write would "
+                    "take the palace writer lease the returning hub needs."
+                ),
+                "grace_window_secs": window,
+                "waited_secs": round(waited, 3),
+                "grace_env": _HUB_GRACE_SECS_ENV,
+                "hint": (
+                    "Retry in a second or two. If the hub is gone for good, "
+                    f"direct writes resume automatically after {window:.0f}s."
+                ),
+            },
+        },
+    }
+
 
 def _hub_proxy_target():
     """Return (base_url, headers) for a live hub serving our palace, or None."""
@@ -8775,12 +9035,15 @@ def _hub_proxy_target():
 
         info = server_registry.read_live_serverinfo(_config.palace_path)
         if not info or info.get("pid") == os.getpid():
+            if not info:
+                _note_hub_missing()
             return None
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
     except Exception:
         logger.debug("hub discovery failed; serving locally", exc_info=True)
         return None
+    _note_hub_record()
     if not _hub_proxy_announced:
         _hub_proxy_announced = True
         logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
@@ -8825,22 +9088,47 @@ def _dispatch_stdio_request(request: dict):
     the failure provably happened before the hub accepted the request — a
     mutating call that failed mid-flight must NOT be replayed locally (the
     hub may still be executing it), so it surfaces as a JSON-RPC error.
+
+    A hub that has *vanished* (no serverinfo record) is the restart case, not
+    the mid-flight case: within the grace window a mutating call gets a
+    retryable "hub restarting" error rather than a direct write that would
+    strand the returning hub. Reads fall back locally either way.
     """
     import urllib.error
 
     target = _hub_proxy_target()
     if target is None:
+        # The kill switch means "never route through a hub", so it must not be
+        # able to stall a write waiting for one either.
+        if (
+            _request_is_mutating(request)
+            and not _truthy_env_off(_HUB_FORWARD_ENV)
+            and _hub_grace_active()
+        ):
+            logger.warning(
+                "Palace hub missing; holding mutating call inside the %.0fs restart "
+                "grace window instead of writing directly",
+                _hub_grace_window_secs(),
+            )
+            return _hub_restarting_error(request)
         return handle_request(request)
     base_url, headers = target
     try:
         from .mcp_proxy import _annotate_forwarded_update_status
 
-        return _annotate_forwarded_update_status(
+        response = _annotate_forwarded_update_status(
             request,
             _forward_request_to_hub(base_url, headers, request, _config.palace_path),
         )
+        _note_hub_seen()
+        return response
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
+        if reached_hub:
+            # The hub answered, just not with a 2xx: it is up.
+            _note_hub_seen()
+        else:
+            _note_hub_missing()
         if not reached_hub and not _request_is_mutating(request):
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
             return handle_request(request)
@@ -8854,6 +9142,10 @@ def _dispatch_stdio_request(request: dict):
                 "message": f"palace hub proxy failed: {exc}",
                 "data": {
                     "hub": base_url,
+                    # A hub record that exists but does not answer is a hub
+                    # mid-boot or wedged, not a vanished one: still never
+                    # replayed locally, and retrying is the correct response.
+                    "retryable": True,
                     "hint": (
                         "The palace hub did not complete this request. Mutating tools "
                         "are not replayed locally — the hub may still be executing the "
@@ -8970,8 +9262,14 @@ def _run_http_loop() -> None:
     # reads + /healthz, return a structured retryable error from palace
     # write tools, and retry the lease in the background until promotion.
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    global _MCP_WRITER_LEASE_SCOPE
+
     owns_writer_lease = False
     if not _READ_ONLY:
+        # The writable hub is the designated single writer: it keeps the lease
+        # for its whole lifetime, including after a background promotion, and
+        # never lets a per-call release hand the palace to a session server.
+        _MCP_WRITER_LEASE_SCOPE = _LEASE_SCOPE_LIFETIME
         writer_ok, writer_reason = _acquire_mcp_writer_lock()
         if writer_ok:
             owns_writer_lease = True

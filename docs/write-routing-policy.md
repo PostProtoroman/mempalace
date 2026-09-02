@@ -122,6 +122,18 @@ index state between calls.
 - MCP stdio opens `sqlite_exact` read-only until it acquires the writer lease.
   It may therefore coexist for reads; mutating tools refuse while another
   process owns the lease and reopen writable storage after that owner exits.
+- MCP stdio holds that lease **per call**, not for its process lifetime: it
+  acquires the palace lock for one mutating tool call, closes its writable
+  storage handles, and releases the lock when the call returns. Closing the
+  handles is what keeps this safe — a lease given back while a Chroma client
+  stayed open would reintroduce the stale-index hazard the lease prevents.
+  The writable daemon and MCP HTTP keep their lifetime hold; they are the
+  designated writers and their handles stay hot.
+- While a hub owns the palace, a stdio server that finds it unreachable does
+  not immediately take over: for `MEMPALACE_HUB_GRACE_SECS` (default 60,
+  config `hub.grace_secs`) a mutating call returns a retryable
+  "hub restarting — retry" error instead of writing directly, so a hub that is
+  restarting comes back to a free lease. Reads fall back locally at once.
 - Read-only MCP HTTP may coexist with the writer.
 - Read-only `sqlite_exact` clients use an immutable connection for a clean
   checkpointed database, or `mode=ro` when an active writer's complete WAL
