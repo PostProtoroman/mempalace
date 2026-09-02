@@ -697,6 +697,7 @@ def mine_formats(
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
+    file_lock=None,
 ) -> None:
     """Mine a directory of binary office-format files into the palace.
 
@@ -786,6 +787,12 @@ def mine_formats(
     # post-try summary print can run safely even if scan_formats or
     # get_collection raises before the for loop starts. Per PR #1555 review
     # (Gemini #5).
+    from .mine_lock import FINALIZE_PHASE, OPEN_PHASE, FileLockCursor
+
+    # ``file_lock`` (the writable MCP hub's dispatch write lock) is taken and
+    # released per source file so a long extract mine never holds it for the
+    # whole run. ``None`` — every CLI/library caller — is a no-op.
+    cursor = FileLockCursor(file_lock)
     files: list = []
     collection = None
     total_drawers = 0
@@ -814,9 +821,10 @@ def mine_formats(
             print("  DRY RUN -- nothing will be filed")
         print(f"{'-' * 55}\n")
 
+        cursor.enter(OPEN_PHASE)
         collection = get_collection(palace_path) if not dry_run else None
 
-        for i, filepath in enumerate(files, 1):
+        for i, filepath in enumerate(cursor.iter(files), 1):
             files_processed = i
             source_file = str(filepath)
 
@@ -944,6 +952,7 @@ def mine_formats(
         # failures must never fail a mine, so any exception is logged and
         # skipped quietly.
         if not dry_run:
+            cursor.enter(FINALIZE_PHASE)
             try:
                 tunnels_added = _compute_topic_tunnels_for_wing(wing, config=palace_config)
                 if tunnels_added:
@@ -967,6 +976,8 @@ def mine_formats(
             # caught per-file errors do not mask the integrity result.
             _validate_palace_fts5_after_mine(palace_path)
     finally:
+        # Give back the per-file lock on every exit path.
+        cursor.release()
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode
         # mines kicked off the same way don't leave a stale PID behind.

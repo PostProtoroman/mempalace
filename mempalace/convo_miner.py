@@ -1033,6 +1033,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    file_lock=None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -1058,6 +1059,12 @@ def mine_convos(
     Chunking parameters (chunk_size, min_chunk_size) are read from
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
+
+    ``file_lock`` is an optional ``label -> context manager`` factory taken
+    and released around each source file (see :mod:`mempalace.mine_lock`).
+    The writable MCP hub passes its dispatch write lock here so a multi-file
+    transcript mine does not hold it for minutes at a stretch. ``None`` — the
+    CLI, library and stdio callers — is a no-op.
     """
     if dry_run:
         return _mine_convos_impl(
@@ -1069,6 +1076,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            file_lock=file_lock,
         )
 
     with mine_palace_lock(palace_path):
@@ -1081,6 +1089,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            file_lock=file_lock,
         )
 
 
@@ -1194,9 +1203,12 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    file_lock=None,
 ):
     from .config import MempalaceConfig
+    from .mine_lock import FINALIZE_PHASE, OPEN_PHASE, FileLockCursor
 
+    cursor = FileLockCursor(file_lock)
     palace_config = MempalaceConfig(palace_path=palace_path)
     cfg_chunk_size = palace_config.chunk_size
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
@@ -1229,6 +1241,9 @@ def _mine_convos_impl(
         print("  DRY RUN -- nothing will be filed")
     print(f"{'-' * 55}\n")
 
+    # Opening the collection and the two prefetch scans touch the same Chroma
+    # handle the per-file writes do, so they belong inside the same lock.
+    cursor.enter(OPEN_PHASE)
     collection = _open_convo_collection(
         palace_path,
         dry_run=dry_run,
@@ -1262,7 +1277,10 @@ def _mine_convos_impl(
     room_counts = defaultdict(int)
     redaction_counts: dict = {}
 
-    for i, filepath in enumerate(files, 1):
+    # cursor.iter moves the caller-supplied lock onto each file before the
+    # body runs and off it when the next file is pulled — the loop body below
+    # is unchanged.
+    for i, filepath in enumerate(cursor.iter(files), 1):
         files_processed = i
         source_file = str(filepath)
 
@@ -1404,12 +1422,16 @@ def _mine_convos_impl(
         if limit > 0 and files_mined >= limit:
             break
 
-    if not dry_run:
-        # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
-        # connection to the Chroma DB, which can invalidate the live collection handle on
-        # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        _validate_palace_fts5_after_mine(palace_path)
+    try:
+        if not dry_run:
+            cursor.enter(FINALIZE_PHASE)
+            # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
+            # connection to the Chroma DB, which can invalidate the live collection handle on
+            # some Chroma builds and make the hallway fetch fail.
+            _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+            _validate_palace_fts5_after_mine(palace_path)
+    finally:
+        cursor.release()
 
     _print_mine_summary(
         files_processed,

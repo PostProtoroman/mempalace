@@ -1914,6 +1914,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    file_lock=None,
 ):
     """Mine a project directory into the palace.
 
@@ -1927,6 +1928,11 @@ def mine(
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely (#1455).
+
+    ``file_lock`` is an optional ``label -> context manager`` factory taken
+    and released around each source file (see :mod:`mempalace.mine_lock`).
+    The writable MCP hub passes its dispatch write lock so a long mine does
+    not hold it for the whole run. ``None`` is a no-op.
     """
     if dry_run:
         return _mine_impl(
@@ -1940,6 +1946,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            file_lock=file_lock,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1957,6 +1964,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            file_lock=file_lock,
         )
 
 
@@ -1971,9 +1979,12 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    file_lock=None,
 ):
     from .config import MempalaceConfig
+    from .mine_lock import FINALIZE_PHASE, OPEN_PHASE, FileLockCursor
 
+    cursor = FileLockCursor(file_lock)
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
@@ -2019,6 +2030,9 @@ def _mine_impl(
     print(f"{'-' * 55}\n")
 
     if not dry_run:
+        # Opening the collections touches the same handle the per-file writes
+        # do, so it belongs inside the same lock as the loop below.
+        cursor.enter(OPEN_PHASE)
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
     else:
@@ -2036,7 +2050,10 @@ def _mine_impl(
     effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
 
     try:
-        for i, filepath in enumerate(files, 1):
+        # cursor.iter moves the caller-supplied lock onto each file before the
+        # body runs and off it when the next file is pulled — the loop body is
+        # otherwise unchanged.
+        for i, filepath in enumerate(cursor.iter(files), 1):
             try:
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
@@ -2086,6 +2103,7 @@ def _mine_impl(
         if not dry_run:
             from .config import MempalaceConfig
 
+            cursor.enter(FINALIZE_PHASE)
             graph_config = MempalaceConfig(palace_path=palace_path)
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
@@ -2208,6 +2226,9 @@ def _mine_impl(
         )
         raise
     finally:
+        # Give back the per-file lock on every exit path — including the
+        # KeyboardInterrupt/exception branches above, which re-raise.
+        cursor.release()
         # Clean up the hooks-side PID lock if it points at us. Stale
         # entries already pass _pid_alive() == False on POSIX, but
         # actively removing the file makes the state observable
