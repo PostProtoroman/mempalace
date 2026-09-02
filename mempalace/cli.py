@@ -1463,6 +1463,8 @@ def cmd_codex_status(args):
 
     print(f"  Codex capture:  {st['state']}")
     print(f"  Writer:         {st['writer']}")
+    if st.get("detail"):
+        print(f"  Detail:         {st['detail']}")
     if st["hub_url"]:
         reach = "reachable" if st["hub_reachable"] else "UNREACHABLE"
         print(f"  Hub:            {st['hub_url']} ({reach})")

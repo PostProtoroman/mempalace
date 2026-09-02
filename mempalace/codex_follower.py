@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,101 @@ BATCH_SIZE = 64
 # unhealthy flag in the heartbeat that `status` surfaces. The 2026-09-01
 # outage failed silently every 15s for hours; this makes that impossible.
 ESCALATION_THRESHOLD = 4
+
+# ── hub restart grace window ────────────────────────────────────────────
+#
+# Mirrors mcp_server's stdio grace window (docs/write-routing-policy.md,
+# "Local backend single-writer safety" -> hub-restart grace) for the same
+# reason: a hub (`mempalace serve`) holds the palace writer flock for its
+# whole lifetime, so when it restarts (watchdog exit 75 + KeepAlive, an
+# operator bootout) the flock is briefly free. Before this lane existed, the
+# very next pass saw HubUnavailable and fell straight to a direct write,
+# taking the flock the returning hub needs -- observed live 2026-09-02: the
+# hub sat in mode=degraded for 12s+ because the follower had grabbed the
+# lease and was holding it as a direct writer.
+#
+# So: once this process has completed a capture pass through a hub for a
+# given palace, a later pass that finds the hub unreachable is held (not
+# written directly) for up to `_hub_grace_window_secs()` seconds. A palace
+# this process has never captured through a hub keeps the pre-existing
+# behaviour -- direct immediately, no window -- which is what makes a
+# from-cold `codex-capture --once` against a palace with no hub instant.
+_HUB_GRACE_SECS_ENV = "MEMPALACE_HUB_GRACE_SECS"
+_HUB_GRACE_SECS_DEFAULT = 60.0
+_HUB_GRACE_SECS_MAX = 3600.0
+
+# Keyed by resolved palace path rather than bare globals: unlike mcp_server
+# (one process, one palace for its whole life), a single follower process --
+# and definitely a single test process -- can legitimately touch more than
+# one palace, and state for one must never leak into a read for another.
+_hub_last_seen_monotonic: dict[str, float] = {}
+_hub_unavailable_since: dict[str, float] = {}
+_HUB_STATE_GUARD = threading.Lock()
+
+
+def _palace_state_key(palace_path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(palace_path)))
+
+
+def _hub_grace_window_secs() -> float:
+    """Seconds to hold a pass for a vanished hub before resuming direct writes.
+
+    Same knob mcp_server reads: ``MEMPALACE_HUB_GRACE_SECS`` first, then
+    ``hub.grace_secs`` in config.json, then 60. Clamped to 0..3600; 0 disables
+    the window (immediate direct fallback).
+    """
+
+    def _parse(raw: str, source: str) -> Optional[float]:
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            secs = float(raw)
+        except ValueError:
+            logger.warning("codex follower: invalid %s=%r; ignoring it", source, raw)
+            return None
+        return min(_HUB_GRACE_SECS_MAX, max(0.0, secs))
+
+    from_env = _parse(os.environ.get(_HUB_GRACE_SECS_ENV, ""), _HUB_GRACE_SECS_ENV)
+    if from_env is not None:
+        return from_env
+    try:
+        from .config import MempalaceConfig
+
+        configured = MempalaceConfig().hub_grace_secs
+    except Exception:
+        configured = None
+    from_config = _parse("" if configured is None else str(configured), "hub.grace_secs")
+    if from_config is not None:
+        return from_config
+    return _HUB_GRACE_SECS_DEFAULT
+
+
+def _note_hub_seen(palace_path: str) -> None:
+    """Record proof that a hub captured for ``palace_path``: this pass, or a prior one."""
+    key = _palace_state_key(palace_path)
+    with _HUB_STATE_GUARD:
+        _hub_last_seen_monotonic[key] = time.monotonic()
+        _hub_unavailable_since.pop(key, None)
+
+
+def _note_hub_missing(palace_path: str) -> Optional[float]:
+    """Record the start of an outage for a hub this process has actually seen.
+
+    Returns the outage's start (monotonic), or ``None`` when this palace has
+    never had a hub -- the caller uses that ``None`` to fall back to direct
+    writes immediately, same as before this lane existed.
+    """
+    key = _palace_state_key(palace_path)
+    with _HUB_STATE_GUARD:
+        if key not in _hub_last_seen_monotonic:
+            return None
+        since = _hub_unavailable_since.get(key)
+        if since is None:
+            since = time.monotonic()
+            _hub_unavailable_since[key] = since
+        return since
+
 
 # Marker written next to the palace so `status` can prove a follower is live
 # without guessing from the process table.
@@ -425,6 +521,42 @@ def scan_once(
     }
 
 
+def _empty_stats(**overrides) -> dict:
+    base = {
+        "drawers_added": 0,
+        "drawers_already_present": 0,
+        "turns_skipped_by_cursor": 0,
+        "files_scanned": 0,
+        "threads_seen": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _close_direct_storage_handles(palace_path: str) -> None:
+    """Drop this process's cached storage client for ``palace_path``.
+
+    Per-pass lease scoping (docs/write-routing-policy.md, "Local backend
+    single-writer safety") means the flock a direct pass takes must not
+    outlive that one pass. The ``with mine_palace_lock(...)`` block around a
+    pass already releases the flock itself at the end of the pass, but the
+    backend registry (:mod:`mempalace.backends.registry`) caches one
+    long-lived ``PersistentClient`` per palace path regardless -- releasing
+    the flock while that client (and the HNSW/FTS state it pins) stays open
+    would reintroduce the exact stale-index hazard the lease exists to
+    prevent. This mirrors ``mcp_server._discard_mcp_storage_handles`` /
+    ``_release_mcp_writer_lock``, the same fix for the MCP stdio writer.
+    Called from inside the flock (before it is released) so a repeated
+    release is always safe.
+    """
+    try:
+        from .palace import get_backend_for_palace
+
+        get_backend_for_palace(palace_path).close_palace(palace_path)
+    except Exception as exc:
+        logger.debug("codex follower: could not close storage handle for %s (%s)", palace_path, exc)
+
+
 def capture_pass(
     palace_path: str,
     sessions_root: str = DEFAULT_SESSIONS_ROOT,
@@ -434,17 +566,24 @@ def capture_pass(
 ) -> dict:
     """One capture pass, routed to whichever writer legitimately owns the palace.
 
-    Exactly one of two paths runs, never both:
+    One of three outcomes, never overlapping:
 
     * A live, writable hub owns the lease -> hand it the work over HTTP. This
       process never touches the palace lock in that case.
-    * No hub -> take ``mine_palace_lock`` and write directly.
+    * The hub is unreachable but this process has captured through a hub for
+      this palace before, and less than the grace window has passed since it
+      vanished -> hold: write nothing, take no lock, and report a clean
+      (non-error) skipped pass so the returning hub finds the flock free.
+    * No hub, or the hub has been gone longer than the grace window -> take
+      ``mine_palace_lock`` for this one pass and write directly.
 
     A hub that answered and then failed is *not* retried locally: it may have
     applied the write, and a local retry would be a second writer. The failure
     is returned so status can show it, and the next pass tries again — no turn
     is dropped, because unwritten turns are still in the rollout and the
-    cursor never advanced past them.
+    cursor never advanced past them. The same is true of a held pass: nothing
+    was written, so nothing needs to be undone, and the next pass (hub or
+    direct) picks the turns up exactly where the cursor left them.
     """
     from .codex_hub import HubRefused, HubUnavailable, capture_via_hub
 
@@ -454,44 +593,64 @@ def capture_pass(
         )
         stats.setdefault("writer", "hub")
         stats["error"] = ""
+        _note_hub_seen(palace_path)
         return stats
     except HubUnavailable as exc:
-        logger.debug("codex follower: no hub (%s); writing directly", exc)
+        logger.debug("codex follower: no hub (%s)", exc)
+        outage_start = _note_hub_missing(palace_path)
+        if outage_start is not None:
+            window = _hub_grace_window_secs()
+            waited = max(0.0, time.monotonic() - outage_start)
+            if waited < window:
+                logger.info(
+                    "codex follower: hub restarting — holding "
+                    "(%.1fs elapsed of %.0fs grace window)",
+                    waited,
+                    window,
+                )
+                return _empty_stats(
+                    writer="hold",
+                    error="",
+                    held_for_hub_restart=True,
+                    grace_window_secs=window,
+                    waited_secs=round(waited, 3),
+                )
+            logger.warning(
+                "codex follower: hub still unreachable after %.0fs grace window; "
+                "resuming direct writes",
+                window,
+            )
+        # else: this process has never captured through a hub for this
+        # palace, so there is no restart to protect -- direct immediately,
+        # same as before this lane existed.
     except HubRefused as exc:
+        # The hub answered /healthz moments before this call failed, so it is
+        # not vanished -- record that so an unrelated later outage still gets
+        # its own full grace window rather than inheriting this timestamp.
+        _note_hub_seen(palace_path)
         logger.error("codex follower: hub refused capture (%s)", exc)
-        return {
-            "writer": "hub",
-            "error": str(exc),
-            "drawers_added": 0,
-            "drawers_already_present": 0,
-            "turns_skipped_by_cursor": 0,
-            "files_scanned": 0,
-            "threads_seen": 0,
-        }
+        return _empty_stats(writer="hub", error=str(exc))
 
     from .palace import MineAlreadyRunning, mine_palace_lock
 
     try:
         with mine_palace_lock(palace_path):
-            stats = scan_once(
-                palace_path,
-                sessions_root,
-                backfill=backfill,
-                include_automation=include_automation,
-            )
+            try:
+                stats = scan_once(
+                    palace_path,
+                    sessions_root,
+                    backfill=backfill,
+                    include_automation=include_automation,
+                )
+            finally:
+                _close_direct_storage_handles(palace_path)
     except MineAlreadyRunning as exc:
         # Another writer holds the lease but published no hub endpoint we can
         # reach. Refusing is correct — two writers is the one thing we must
         # never do — and the turns stay in the rollout for the next pass.
-        return {
-            "writer": "blocked",
-            "error": f"palace writer lease held by another process: {exc}",
-            "drawers_added": 0,
-            "drawers_already_present": 0,
-            "turns_skipped_by_cursor": 0,
-            "files_scanned": 0,
-            "threads_seen": 0,
-        }
+        return _empty_stats(
+            writer="blocked", error=f"palace writer lease held by another process: {exc}"
+        )
     stats["writer"] = "direct"
     stats["error"] = ""
     return stats
@@ -564,6 +723,13 @@ def follow(
     (``type=status``, ``to_agent=*``) per outage, and the heartbeat carries
     ``consecutive_failures`` so ``status`` shows unhealthy. A clean pass ends
     the outage and re-arms the announcement.
+
+    A pass held inside the hub restart grace window (``held_for_hub_restart``)
+    is neither: it neither builds toward escalation nor clears an outage
+    already in progress, since it proves nothing about whether capture is
+    actually healthy — it just declined to race a restarting hub for the
+    lease. Only a hold that outlives the window and then fails as a direct
+    write counts, same as any other failure.
     """
     passes = 0
     consecutive_failures = 0
@@ -574,6 +740,7 @@ def follow(
             stats = capture_pass(palace_path, sessions_root, include_automation=include_automation)
             passes += 1
             error = str(stats.get("error") or "")
+            held = bool(stats.get("held_for_hub_restart"))
             if error:
                 consecutive_failures += 1
                 if consecutive_failures >= escalation_threshold:
@@ -587,6 +754,12 @@ def follow(
                         outage_announced = _announce_outage(
                             palace_path, error, str(stats.get("writer") or ""), consecutive_failures
                         )
+            elif held:
+                # A restart is expected, not an outage: neither builds toward
+                # escalation nor clears an outage already in progress. Only a
+                # hold that outlasts the grace window and then fails direct
+                # (the `if error:` branch above) should move the counter.
+                pass
             else:
                 if outage_announced:
                     logger.info(
@@ -664,6 +837,11 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
       are not lost, but nothing is being captured until it clears. A follower
       that has hit :data:`ESCALATION_THRESHOLD` consecutive failed passes is
       also BLOCKED, with ``unhealthy: True`` and the failure count surfaced.
+
+    A pass held inside the hub restart grace window (``writer: "hold"``) is
+    its own case, reported as DEGRADED with ``holding_for_hub_restart: True``
+    and ``detail: "holding for hub restart"`` — expected and self-clearing,
+    never BLOCKED and never counted toward ``unhealthy``.
     """
     from .codex_hub import hub_is_healthy, hub_target
 
@@ -673,6 +851,7 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
     last = hb.get("last_scan") or {}
     last_error = str(last.get("error") or "")
     writer = str(last.get("writer") or "")
+    holding = writer == "hold" or bool(last.get("held_for_hub_restart"))
     consecutive_failures = hb.get("consecutive_failures")
     if not isinstance(consecutive_failures, int):
         consecutive_failures = 0
@@ -707,6 +886,8 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
 
     if writer == "blocked" or (writer == "hub" and last_error) or unhealthy:
         state = "BLOCKED"
+    elif holding:
+        state = "DEGRADED"
     elif running and not last_error:
         state = "ACTIVE"
     else:
@@ -714,6 +895,8 @@ def status(palace_path: str, sessions_root: str = DEFAULT_SESSIONS_ROOT) -> dict
 
     return {
         "state": state,
+        "detail": "holding for hub restart" if holding else "",
+        "holding_for_hub_restart": holding,
         "unhealthy": unhealthy,
         "consecutive_failures": consecutive_failures,
         "outage_announced": bool(hb.get("outage_announced")),

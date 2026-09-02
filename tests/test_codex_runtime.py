@@ -1,22 +1,27 @@
 """Runtime blockers for Codex capture: hub-routed writes, service, status.
 
-Covers the two things that stopped capture working on a real machine:
+Covers the three things that stopped capture working on a real machine:
 
 1. A hub owns the palace writer lease for its whole lifetime, so a follower
    that grabbed ``mine_palace_lock`` itself was refused exactly where a hub
    runs. Capture is handed to the hub instead — and never to both.
 2. A foreground follower dies with the terminal. There is now an installable
    login service.
+3. A hub restart briefly frees the flock. A follower that has watched a hub
+   own this palace before now holds (writes nothing, takes no lock) for the
+   grace window instead of racing the restarting hub for its own lease — see
+   ``TestHubRestartGraceWindow`` below and docs/write-routing-policy.md.
 """
 
 from __future__ import annotations
 
 import json
 import plistlib
+import time
 
 import pytest
 
-from mempalace import codex_hub, codex_service
+from mempalace import codex_follower, codex_hub, codex_service
 from mempalace.codex_follower import capture_pass, scan_once, status
 
 from tests.test_codex_capture import _item, _meta, _write_rollout
@@ -326,6 +331,341 @@ def test_consecutive_failures_escalate_to_error_and_one_event(tmp_path, monkeypa
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert errors, "threshold crossing must log at ERROR, not lower"
     assert any("consecutive failed passes" in r.getMessage() for r in errors)
+
+
+# ── hub restart grace window ─────────────────────────────────────────
+#
+# A hub (`mempalace serve`) holds the palace writer flock for its whole
+# lifetime. During a restart the flock is briefly free; before this lane
+# existed, the very next pass saw HubUnavailable and wrote directly, taking
+# the flock the returning hub needed (live 2026-09-02: the hub sat in
+# mode=degraded for 12s+ while the follower held the lease as a direct
+# writer). See docs/write-routing-policy.md and mempalace/mcp_server.py's
+# ``_hub_grace_active`` for the sibling lane on the MCP stdio side.
+
+
+def _throw(exc):
+    def _raiser(*_a, **_k):
+        raise exc
+
+    return _raiser
+
+
+class TestHubRestartGraceWindow:
+    def test_never_seen_hub_writes_directly_with_no_hold(self, tmp_path, monkeypatch):
+        """A follower that has never captured through a hub for this palace
+        keeps today's behaviour: no window, no hold, direct at once."""
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "n1", [_meta(), _item("user", "u1", "cold start", 1)])
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("no hub")),
+        )
+
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "direct"
+        assert stats["drawers_added"] == 1
+        assert not stats.get("held_for_hub_restart")
+
+    def test_hold_inside_the_window_takes_no_lock_and_writes_nothing(self, tmp_path, monkeypatch):
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "w1", [_meta(), _item("user", "u1", "must not be lost", 1)])
+        key = codex_follower._palace_state_key(palace)
+        now = time.monotonic()
+        monkeypatch.setitem(codex_follower._hub_last_seen_monotonic, key, now)
+        monkeypatch.setitem(codex_follower._hub_unavailable_since, key, now)
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("restarting")),
+        )
+        monkeypatch.setattr(
+            "mempalace.palace.mine_palace_lock",
+            _throw(AssertionError("held pass took the palace writer lease")),
+        )
+
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "hold"
+        assert stats["error"] == ""
+        assert stats["held_for_hub_restart"] is True
+        assert stats["drawers_added"] == 0
+        # Nothing was written and the cursor never advanced, so the turn is
+        # still there for the next pass to pick up.
+        #
+        # Escalation accounting for held passes is exercised end-to-end via
+        # follow() below: test_held_pass_does_not_count_toward_escalation and
+        # test_hold_does_not_reset_an_in_progress_failure_streak.
+
+    def test_direct_resumes_once_the_window_elapses(self, tmp_path, monkeypatch):
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "e1", [_meta(), _item("user", "u1", "after the window", 1)])
+        key = codex_follower._palace_state_key(palace)
+        long_ago = time.monotonic() - 120.0
+        monkeypatch.setitem(codex_follower._hub_last_seen_monotonic, key, long_ago)
+        monkeypatch.setitem(codex_follower._hub_unavailable_since, key, long_ago)
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("still gone")),
+        )
+
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "direct"
+        assert stats["drawers_added"] == 1
+
+    def test_direct_failure_after_the_window_still_escalates(self, tmp_path, monkeypatch):
+        """Item 4: a hold that outlives the window and then fails direct counts."""
+        from mempalace.palace import MineAlreadyRunning
+
+        palace = str(tmp_path / "palace")
+        key = codex_follower._palace_state_key(palace)
+        long_ago = time.monotonic() - 200.0
+        monkeypatch.setitem(codex_follower._hub_last_seen_monotonic, key, long_ago)
+        monkeypatch.setitem(codex_follower._hub_unavailable_since, key, long_ago)
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("still gone")),
+        )
+        monkeypatch.setattr(
+            "mempalace.palace.mine_palace_lock",
+            _throw(MineAlreadyRunning("palace is held by PID 4242")),
+        )
+
+        stats = capture_pass(palace, "unused-root")
+        assert stats["writer"] == "blocked"
+        assert stats["error"]
+
+    def test_env_and_config_knobs_match_mcp_server(self, monkeypatch):
+        monkeypatch.delenv("MEMPALACE_HUB_GRACE_SECS", raising=False)
+        assert codex_follower._hub_grace_window_secs() == codex_follower._HUB_GRACE_SECS_DEFAULT
+        monkeypatch.setenv("MEMPALACE_HUB_GRACE_SECS", "12.5")
+        assert codex_follower._hub_grace_window_secs() == 12.5
+        monkeypatch.setenv("MEMPALACE_HUB_GRACE_SECS", "999999")
+        assert codex_follower._hub_grace_window_secs() == codex_follower._HUB_GRACE_SECS_MAX
+        monkeypatch.setenv("MEMPALACE_HUB_GRACE_SECS", "not-a-number")
+        assert codex_follower._hub_grace_window_secs() == codex_follower._HUB_GRACE_SECS_DEFAULT
+
+    def test_zero_window_disables_the_hold(self, tmp_path, monkeypatch):
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "z1", [_meta(), _item("user", "u1", "no window", 1)])
+        key = codex_follower._palace_state_key(palace)
+        now = time.monotonic()
+        monkeypatch.setitem(codex_follower._hub_last_seen_monotonic, key, now)
+        monkeypatch.setitem(codex_follower._hub_unavailable_since, key, now)
+        monkeypatch.setenv("MEMPALACE_HUB_GRACE_SECS", "0")
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("gone")),
+        )
+
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "direct"
+
+    def test_status_reports_holding_for_hub_restart(self, tmp_path, monkeypatch):
+        palace, root = _seed(tmp_path)
+        scan_once(palace, str(root))
+        from mempalace.codex_follower import _write_heartbeat
+
+        _write_heartbeat(
+            palace,
+            sessions_root=str(root),
+            running=True,
+            last_scan={
+                "writer": "hold",
+                "error": "",
+                "held_for_hub_restart": True,
+                "grace_window_secs": 60.0,
+                "waited_secs": 3.2,
+            },
+        )
+        monkeypatch.setattr("mempalace.codex_follower._pid_alive", lambda pid: True)
+        st = status(palace, str(root))
+        assert st["state"] == "DEGRADED"
+        assert st["holding_for_hub_restart"] is True
+        assert st["detail"] == "holding for hub restart"
+        assert st["unhealthy"] is False
+
+
+class TestHubRestartRecovery:
+    def test_hub_gone_hold_direct_then_hub_back(self, tmp_path, monkeypatch):
+        """The full lifecycle: hub -> grace hold -> direct -> hub again.
+
+        Recovery needs no special-case code: capture_pass always re-probes
+        the hub first, so as soon as it answers again the very next pass goes
+        back to writer=hub on its own.
+        """
+        import mempalace.palace as palace_mod
+
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "r1", [_meta(), _item("user", "u1", "first turn", 1)])
+        _write_rollout(root, "r2", [_meta(), _item("user", "u2", "written after recovery", 2)])
+        real_lock = palace_mod.mine_palace_lock
+        key = codex_follower._palace_state_key(palace)
+
+        # Pass 1: hub answers and writes -- this process has now "seen" a hub.
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            lambda p, s, **kw: {
+                "writer": "hub",
+                "drawers_added": 1,
+                "drawers_already_present": 0,
+            },
+        )
+        stats1 = capture_pass(palace, str(root))
+        assert stats1["writer"] == "hub"
+        assert key in codex_follower._hub_last_seen_monotonic
+
+        # Pass 2: hub vanishes -- inside the window, so hold; never touch the lock.
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("restarting")),
+        )
+        monkeypatch.setattr(
+            "mempalace.palace.mine_palace_lock",
+            _throw(AssertionError("held pass took the palace writer lease")),
+        )
+        stats2 = capture_pass(palace, str(root))
+        assert stats2["writer"] == "hold"
+
+        # Fast-forward past the window: now genuinely gone -- direct engages.
+        monkeypatch.setitem(codex_follower._hub_unavailable_since, key, time.monotonic() - 120.0)
+        monkeypatch.setattr("mempalace.palace.mine_palace_lock", real_lock)
+        stats3 = capture_pass(palace, str(root))
+        assert stats3["writer"] == "direct"
+        # Pass 1 went through the (faked) hub and never actually wrote to the
+        # palace, so both rollouts' turns are still unwritten here.
+        assert stats3["drawers_added"] == 2
+
+        # Pass 4: hub comes back on its own -- capture_pass tries it first.
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            lambda p, s, **kw: {
+                "writer": "hub",
+                "drawers_added": 0,
+                "drawers_already_present": 2,
+            },
+        )
+        stats4 = capture_pass(palace, str(root))
+        assert stats4["writer"] == "hub"
+
+
+class TestPerPassLeaseScoping:
+    """Item 2: a direct pass's flock and storage handles live for one pass only."""
+
+    def test_lock_file_is_free_between_direct_passes(self, tmp_path, monkeypatch):
+        """A peer must be able to take the flock right after a direct pass ends."""
+        import mempalace.palace as palace_mod
+
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "l1", [_meta(), _item("user", "u1", "released after", 1)])
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("no hub")),
+        )
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "direct"
+
+        # A second, independent open-file-description contends exactly like a
+        # peer process would -- but only if capture_pass actually gave the
+        # flock back rather than holding it across the (simulated) sleep
+        # between passes.
+        monkeypatch.setattr(palace_mod, "_held_by_this_process", lambda key: False)
+        peer = palace_mod.mine_palace_lock(palace)
+        peer.__enter__()
+        peer.__exit__(None, None, None)
+
+    def test_storage_handle_is_discarded_after_a_direct_pass(self, tmp_path, monkeypatch):
+        """The cached PersistentClient must not survive past the pass that opened it.
+
+        A flock release with the backend's client still cached would leave a
+        long-lived HNSW/FTS handle open across the release -- the same
+        stale-index hazard mcp_server's ``_discard_mcp_storage_handles``
+        exists to prevent (docs/write-routing-policy.md).
+        """
+        from mempalace.palace import get_backend_for_palace
+
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "h1", [_meta(), _item("user", "u1", "handle closed", 1)])
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("no hub")),
+        )
+        stats = capture_pass(palace, str(root))
+        assert stats["writer"] == "direct"
+        assert stats["drawers_added"] == 1
+
+        backend = get_backend_for_palace(palace)
+        assert palace not in getattr(backend, "_clients", {palace: object()})
+
+    def test_storage_handle_is_discarded_even_when_scan_raises(self, tmp_path, monkeypatch):
+        palace = str(tmp_path / "palace")
+        root = tmp_path / "sessions"
+        _write_rollout(root, "x1", [_meta(), _item("user", "u1", "boom", 1)])
+
+        monkeypatch.setattr(
+            "mempalace.codex_hub.capture_via_hub",
+            _throw(codex_hub.HubUnavailable("no hub")),
+        )
+        monkeypatch.setattr(
+            "mempalace.codex_follower.scan_once",
+            _throw(RuntimeError("boom")),
+        )
+
+        with pytest.raises(RuntimeError):
+            capture_pass(palace, str(root))
+
+        from mempalace.palace import get_backend_for_palace
+
+        backend = get_backend_for_palace(palace)
+        assert palace not in getattr(backend, "_clients", {palace: object()})
+
+
+def test_held_pass_does_not_count_toward_escalation(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    hold_stats = {
+        "writer": "hold",
+        "error": "",
+        "held_for_hub_restart": True,
+        "drawers_added": 0,
+        "drawers_already_present": 0,
+    }
+    _run_follow(palace, monkeypatch, [hold_stats] * (codex_follower.ESCALATION_THRESHOLD + 2))
+
+    from mempalace.codex_follower import read_heartbeat
+
+    hb = read_heartbeat(palace)
+    assert hb["consecutive_failures"] == 0
+    assert hb["outage_announced"] is False
+
+
+def test_hold_does_not_reset_an_in_progress_failure_streak(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    hold_stats = {
+        "writer": "hold",
+        "error": "",
+        "held_for_hub_restart": True,
+        "drawers_added": 0,
+        "drawers_already_present": 0,
+    }
+    results = [_fail_stats(), _fail_stats(), hold_stats, _fail_stats(), _fail_stats()]
+    _run_follow(palace, monkeypatch, results)
+
+    from mempalace.codex_follower import read_heartbeat
+
+    hb = read_heartbeat(palace)
+    assert hb["consecutive_failures"] == 4
 
     events = _outage_events(palace)
     assert len(events) == 1, "one status event per outage, not per pass"
