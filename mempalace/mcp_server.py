@@ -3805,13 +3805,35 @@ def _hub_mine_file_lock(label: str):
     waits for one file, not for a whole 80 MB transcript. The stall watchdog
     is armed per file too (``force=True``), so a genuinely wedged chromadb
     write still trips it while a long-but-progressing job never does.
+
+    One caveat on cost: the ``<open>`` phase covers embedder and
+    ``PersistentClient`` initialization, so on a cold process that single hold
+    can run to several seconds (0.016s warm). A hub with
+    ``MEMPALACE_EAGER_WARMUP`` has paid that already; one without it will see
+    the first mine's open phase block peers briefly.
     """
     with _HTTP_REQUEST_LOCK:
-        with _write_stall_watch(f"mempalace_mine[{os.path.basename(label) or label}]", force=True):
+        with _write_stall_watch(f"mempalace_mine[{_stall_label(label)}]", force=True):
             yield
 
 
-def _mine_execute_on_hub(src: str, **kwargs) -> dict:
+def _stall_label(label: str) -> str:
+    """Shorten a source path for a stall warning without making it ambiguous.
+
+    A bare basename is useless for the thing the label exists for: every
+    Claude Code transcript is ``<session-id>.jsonl`` under a different project
+    directory, so an operator reading "stuck on conversation.jsonl" learns
+    nothing. Keep the parent directory too.
+    """
+    label = str(label)
+    parent, base = os.path.split(label)
+    if not base:
+        return label
+    grandparent = os.path.basename(parent)
+    return f"{grandparent}/{base}" if grandparent else base
+
+
+def _mine_execute_on_hub(src: str, should_stop=None, **kwargs) -> dict:
     """``_mine_execute`` under the hub's per-file write lock.
 
     The miners release their per-file hold on the paths they guard, but not on
@@ -3823,17 +3845,37 @@ def _mine_execute_on_hub(src: str, **kwargs) -> dict:
     write by every agent — permanently, silently, and worse than the restart
     storm this change exists to stop. So the lock's owner guarantees the
     release instead of trusting three miners' control flow to.
+
+    ``should_stop`` is the queue's shutdown predicate. It rides on the factory
+    because that is the object the miners already thread all the way down to
+    :class:`~mempalace.mine_lock.FileLockCursor`, which consults it at each
+    file boundary.
     """
     from .mine_lock import GuardedFileLock
 
-    with GuardedFileLock(_hub_mine_file_lock) as guarded:
+    factory = _hub_mine_file_lock
+    if should_stop is not None:
+        factory = _StoppableFileLockFactory(_hub_mine_file_lock, should_stop)
+    with GuardedFileLock(factory) as guarded:
         return _mine_execute(src, file_lock=guarded, **kwargs)
+
+
+class _StoppableFileLockFactory:
+    """``_hub_mine_file_lock`` plus a ``should_stop`` predicate."""
+
+    def __init__(self, factory, should_stop):
+        self._factory = factory
+        self.should_stop = should_stop
+
+    def __call__(self, label: str):
+        return self._factory(label)
 
 
 def _run_mine_job(job) -> dict:
     """Worker entry point: run one queued job on the hub's own handles."""
     return _mine_execute_on_hub(
         job.source,
+        should_stop=job.should_stop,
         mode=job.mode,
         wing=job.wing,
         agent=job.agent,
@@ -3863,6 +3905,23 @@ def _start_mine_queue():
             )
             _MINE_QUEUE = MineQueue(_run_mine_job, journal_path=journal)
             _MINE_QUEUE.start()
+            if _MINE_QUEUE.orphans:
+                # The queue is in memory, so a previous hub that died or was
+                # restarted mid-mine took its accepted jobs with it — after
+                # the CLI had already told the hook operator they were queued.
+                # Losing them is the accepted trade-off; losing them quietly
+                # is not, so say so loudly, once, at startup.
+                logger.warning(
+                    "Hub mine queue: %d mine job(s) accepted by a previous run were never "
+                    "finished and are LOST (the queue is in-memory). Resubmit them or wait "
+                    "for the next hook fire: %s. See mine_queue.lost_previous_run in "
+                    "/statusz and `mempalace doctor`.",
+                    len(_MINE_QUEUE.orphans),
+                    ", ".join(
+                        f"{o.get('job_id')}[{o.get('state')}] {o.get('source')}"
+                        for o in _MINE_QUEUE.orphans[:10]
+                    ),
+                )
             logger.info(
                 "Hub mine queue started; mempalace_mine now enqueues and returns a job id "
                 "(journal: %s). Set %s=0 for inline mines.",
@@ -3872,22 +3931,52 @@ def _start_mine_queue():
     return _MINE_QUEUE
 
 
-def _stop_mine_queue(timeout: float = 30.0) -> None:
-    """Stop the mine worker and forget the queue.
+def _stop_mine_queue(timeout: float = 30.0, grace: float = 30.0) -> None:
+    """Stop the mine worker, and do not return while one is mid-file.
 
     Called on the way out of the HTTP loop, before the writer lease is
-    released: a worker still inside a file when the lease goes back would be
-    writing to a palace this process no longer owns. The subsequent
-    ``with _HTTP_REQUEST_LOCK`` around the release is the hard barrier — it
-    cannot be taken until the worker's current per-file hold ends — this just
-    stops it from starting another job first. Queued jobs are dropped; the
-    hooks that submitted them fire again.
+    released: a worker still inside a file when the lease goes back is writing
+    to a palace this process no longer owns.
+
+    The dispatch lock is emphatically **not** a barrier against that. Locking
+    is per file precisely so peers can interleave, which means there is a free
+    gap between every pair of the worker's holds — the release path would win
+    one of those gaps within a second and hand back the lease while the worker
+    went on to take the lock again for the next file. The barrier is here
+    instead: ``queue.stop()`` drops the backlog and asks the running job to
+    end at its next file boundary, and this function waits (bounded) for the
+    worker to actually be gone before letting the caller proceed. If the wait
+    runs out anyway, that is logged as an error naming the job, because the
+    lease release that follows is then genuinely racing a live writer.
     """
     global _MINE_QUEUE
     with _MINE_QUEUE_LOCK:
         queue, _MINE_QUEUE = _MINE_QUEUE, None
-    if queue is not None:
-        queue.stop(timeout)
+    if queue is None:
+        return
+    summary = queue.stop(timeout)
+    if summary["worker_alive"] and grace > 0:
+        # stop() already asked for a file-boundary exit; give the current file
+        # that long to end before we start treating this as a problem.
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and queue.status()["worker_alive"]:
+            time.sleep(0.25)
+        summary["worker_alive"] = queue.status()["worker_alive"]
+    interrupted = summary.get("interrupted")
+    if interrupted:
+        logger.warning(
+            "Hub mine queue: job %s (%s) was interrupted mid-mine at shutdown; "
+            "it is journalled as 'interrupted' and its source is only partly mined.",
+            interrupted.get("job_id"),
+            interrupted.get("source"),
+        )
+    if summary["worker_alive"]:
+        logger.error(
+            "Hub mine queue: worker still running after %.0fs stop + %.0fs grace; "
+            "releasing the writer lease with a mine possibly still writing.",
+            timeout,
+            grace,
+        )
 
 
 def _mine_queue_status() -> dict:

@@ -206,9 +206,14 @@ def test_completed_job_is_journalled(tmp_path):
     finally:
         q.stop()
 
-    lines = (tmp_path / "mine_jobs.jsonl").read_text().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    records = [
+        json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().strip().splitlines()
+    ]
+    # Every transition is journalled now, not just the terminal one: an
+    # accepted job that never runs has to leave a trace (see
+    # test_dropped_jobs_are_journalled_and_visible_after_a_restart).
+    assert [r["state"] for r in records] == ["accepted", "started", "succeeded"]
+    record = records[-1]
     assert record["event"] == "mine_job"
     assert record["job_id"] == job.id
     assert record["mode"] == "convos"
@@ -240,10 +245,11 @@ def test_failing_job_is_journalled_and_the_worker_survives(tmp_path):
         q.stop()
 
     records = [json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()]
-    assert records[0]["state"] == "failed"
-    assert "chroma exploded" in records[0]["error"]
-    assert records[0]["error_class"] == "RuntimeError"
-    assert records[1]["state"] == "succeeded"
+    terminal = [r for r in records if r["state"] not in ("accepted", "started")]
+    assert terminal[0]["state"] == "failed"
+    assert "chroma exploded" in terminal[0]["error"]
+    assert terminal[0]["error_class"] == "RuntimeError"
+    assert terminal[1]["state"] == "succeeded"
 
 
 def test_status_reports_running_queued_and_last_completed():
@@ -494,7 +500,7 @@ def test_watchdog_still_trips_on_one_wedged_file(monkeypatch):
 
     with mcp_server._hub_mine_file_lock("/p/wedged.jsonl"):
         inflight = mcp_server._write_stall_inflight
-        assert inflight["tool"] == "mempalace_mine[wedged.jsonl]"
+        assert inflight["tool"] == "mempalace_mine[p/wedged.jsonl]"
         assert mcp_server._write_stall_action(200.0, 60.0, 180.0, False) == "exit"
 
 
@@ -614,3 +620,274 @@ def test_hub_mine_never_leaves_the_dispatch_lock_held(monkeypatch):
     # And the lock is genuinely re-acquirable, not just flagged free.
     with lock:
         pass
+
+
+# ── shutdown: stop() must actually stop ──────────────────────────────────
+
+
+def test_stop_does_not_let_the_worker_drain_the_backlog(tmp_path):
+    """The blocker this file exists to pin: a stopping worker starts nothing.
+
+    Before the fix ``_next_job`` consulted ``_stopping`` only when the pending
+    list was empty, so ``stop()`` returned, the hub went on to release the
+    writer lease — and the worker ran the whole remaining backlog against a
+    palace this process no longer owned.
+    """
+    started = []
+    gate = threading.Event()
+
+    def runner(job):
+        started.append(job.id)
+        gate.wait(5)
+        return {"success": True, "output": ""}
+
+    q = _queue(runner, tmp_path)
+    try:
+        q.submit(source="/tmp/a", mode="convos")
+        b, _ = q.submit(source="/tmp/b", mode="convos")
+        c, _ = q.submit(source="/tmp/c", mode="convos")
+        for _ in range(100):
+            if started:
+                break
+            time.sleep(0.02)
+        assert len(started) == 1
+
+        summary = q.stop(timeout=0.5)
+        assert {job["job_id"] for job in summary["dropped"]} == {b.id, c.id}
+        gate.set()
+        time.sleep(0.3)
+        assert started == started[:1], "worker started a job after stop()"
+    finally:
+        gate.set()
+        q.stop()
+
+    assert q.status()["worker_alive"] is False
+    assert b.state == "dropped" and c.state == "dropped"
+
+
+def test_dropped_jobs_are_journalled_and_visible_after_a_restart(tmp_path):
+    """Lost is acceptable; silently lost is the blocker.
+
+    The CLI has already told the hook operator "hub queued mine as <id>", so a
+    dropped job must leave a journal line, and the next hub must be able to
+    name it.
+    """
+    gate = threading.Event()
+
+    def runner(job):
+        gate.wait(5)
+        return {"success": True, "output": ""}
+
+    q = _queue(runner, tmp_path)
+    q.submit(source="/tmp/running", mode="convos")
+    time.sleep(0.15)
+    dropped, _ = q.submit(source="/tmp/dropped", mode="convos")
+    q.stop(timeout=0.2)
+    gate.set()
+
+    records = [json.loads(line) for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()]
+    drop_records = [r for r in records if r["state"] == "dropped"]
+    assert [r["job_id"] for r in drop_records] == [dropped.id]
+    assert drop_records[0]["source"].endswith("dropped")
+
+
+def test_unfinished_jobs_reports_the_previous_runs_casualties(tmp_path):
+    journal = tmp_path / "mine_jobs.jsonl"
+    rows = [
+        # A job that ran to completion in the old process — not a casualty.
+        {"event": "mine_job", "job_id": "m1", "state": "accepted", "pid": 111},
+        {"event": "mine_job", "job_id": "m1", "state": "started", "pid": 111},
+        {"event": "mine_job", "job_id": "m1", "state": "succeeded", "pid": 111},
+        # Accepted, started, and then the process died: this is the one.
+        {"event": "mine_job", "job_id": "m2", "state": "accepted", "pid": 111},
+        {"event": "mine_job", "job_id": "m2", "state": "started", "pid": 111},
+        # Accepted and never even started.
+        {"event": "mine_job", "job_id": "m3", "state": "accepted", "pid": 111},
+        # Explicitly dropped at a clean shutdown — recorded, so not "unknown".
+        {"event": "mine_job", "job_id": "m4", "state": "dropped", "pid": 111},
+        # This process's own in-flight job must not look like a casualty.
+        {"event": "mine_job", "job_id": "m5", "state": "started", "pid": 222},
+        "{not json",
+        "",
+        json.dumps({"event": "something_else", "job_id": "m6", "state": "started"}),
+    ]
+    journal.write_text("\n".join(r if isinstance(r, str) else json.dumps(r) for r in rows) + "\n")
+
+    from mempalace.mine_queue import unfinished_jobs
+
+    lost = {r["job_id"] for r in unfinished_jobs(str(journal), exclude_pid=222)}
+    assert lost == {"m2", "m3"}
+    assert unfinished_jobs(str(tmp_path / "nope.jsonl")) == []
+    assert unfinished_jobs(None) == []
+
+
+def test_status_surfaces_jobs_lost_by_the_previous_run(tmp_path):
+    journal = tmp_path / "mine_jobs.jsonl"
+    journal.write_text(
+        json.dumps(
+            {
+                "event": "mine_job",
+                "job_id": "m-lost",
+                "state": "started",
+                "source": "/p/x.jsonl",
+                "pid": 999999,
+            }
+        )
+        + "\n"
+    )
+    q = MineQueue(lambda job: {"success": True}, journal_path=str(journal))
+    status = q.status()
+    assert status["lost_previous_run"] == 1
+    assert status["lost_previous_run_jobs"][0]["job_id"] == "m-lost"
+
+
+def test_a_stopping_queue_interrupts_the_running_job_at_a_file_boundary(tmp_path):
+    """stop() asks the in-flight job to wind up, and the cursor obeys per file.
+
+    Without this the running mine keeps taking the dispatch lock file after
+    file while the hub hands back the writer lease underneath it.
+    """
+    mined = []
+    reached_first_file = threading.Event()
+
+    def runner(job):
+        lock = _RecordingLock()
+        lock.should_stop = job.should_stop
+        cursor = FileLockCursor(lock)
+        for name in cursor.iter(["a", "b", "c", "d"]):
+            mined.append(name)
+            reached_first_file.set()
+            time.sleep(0.05)
+        cursor.release()
+        return {"success": True, "output": ""}
+
+    q = _queue(runner, tmp_path)
+    job, _ = q.submit(source="/tmp/many", mode="convos")
+    assert reached_first_file.wait(5)
+    q.stop(timeout=5)
+
+    assert job.wait(5)
+    assert mined != ["a", "b", "c", "d"], "the job mined every file despite stop()"
+    assert job.state == "interrupted"
+    states = [
+        json.loads(line)["state"]
+        for line in (tmp_path / "mine_jobs.jsonl").read_text().splitlines()
+    ]
+    assert states[-1] == "interrupted"
+
+
+def test_stop_mine_queue_waits_for_the_running_job_before_returning(monkeypatch):
+    """_stop_mine_queue is the barrier, not the dispatch lock.
+
+    Per-file locking leaves a free gap between every pair of the worker's
+    holds, so the lease release would win one; the shutdown path must not come
+    back while a job is still mid-file.
+    """
+    release = threading.Event()
+    left = threading.Event()
+
+    def runner(job):
+        release.wait(5)
+        left.set()
+        return {"success": True, "output": ""}
+
+    q = MineQueue(runner)
+    q.start()
+    monkeypatch.setattr(mcp_server, "_MINE_QUEUE", q)
+    q.submit(source="/tmp/slow", mode="convos")
+    time.sleep(0.15)
+
+    done = threading.Event()
+    threading.Thread(target=lambda: (mcp_server._stop_mine_queue(0.2, 5.0), done.set())).start()
+    assert not done.wait(0.6), "_stop_mine_queue returned while a mine was running"
+    release.set()
+    assert done.wait(5)
+    assert left.is_set()
+
+
+def test_stoppable_factory_carries_should_stop_through_the_guard():
+    flag = {"stop": False}
+    lock = _RecordingLock()
+    factory = mcp_server._StoppableFileLockFactory(lock, lambda: flag["stop"])
+    with GuardedFileLock(factory) as guarded:
+        cursor = FileLockCursor(guarded)
+        seen = []
+        for name in cursor.iter(["a", "b", "c"]):
+            seen.append(name)
+            flag["stop"] = True
+        cursor.release()
+    assert seen == ["a"]
+    assert cursor.interrupted is True
+    assert lock.events[-1] == ("release", "a")
+
+
+# ── nits ─────────────────────────────────────────────────────────────────
+
+
+def test_watched_write_tools_never_nest():
+    """_write_stall_watch save/restores ``previous``; that is only sound while
+    no lock-free tool is also a watched vector write."""
+    assert mcp_server._HTTP_LOCK_FREE_TOOLS & mcp_server._VECTOR_WRITE_TOOLS == frozenset()
+
+
+def test_stall_label_keeps_the_parent_directory():
+    """Every Claude Code transcript is <uuid>.jsonl under a different project
+    dir; a bare basename tells an operator nothing about which one wedged."""
+    a = mcp_server._stall_label("/x/proj-a/conversation.jsonl")
+    b = mcp_server._stall_label("/x/proj-b/conversation.jsonl")
+    assert a != b
+    assert a == "proj-a/conversation.jsonl"
+    assert mcp_server._stall_label("<open>") == "<open>"
+
+
+def test_queued_payload_does_not_say_position_0_for_a_running_job():
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def runner(job):
+        entered.set()
+        gate.wait(5)
+        return {"success": True, "output": ""}
+
+    q = _queue(runner)
+    try:
+        job, created = q.submit(source="/tmp/a", mode="convos")
+        assert entered.wait(5)
+        message = q.queued_payload(job, created)["message"]
+        assert "position 0" not in message
+        assert "already running" in message
+    finally:
+        gate.set()
+        q.stop()
+
+
+def test_a_real_mine_takes_the_lock_once_per_source_file(tmp_path):
+    """Altitude check: drive ``miner.mine`` itself, not FileLockCursor.
+
+    The other lock tests drive the cursor directly, so they would still pass if
+    a miner quietly stopped routing its loop through ``cursor.iter``. This one
+    runs a real three-file project mine with a recording lock factory and
+    asserts the shape of the holds it actually produced: one ``<open>``, one
+    per file, one ``<finalize>``, never nested, nothing left held.
+    """
+    from mempalace.miner import mine
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    source = tmp_path / "proj"
+    source.mkdir()
+    for n in range(3):
+        (source / f"f{n}.md").write_text(f"# doc {n}\n" + ("content about lock scoping. " * 60))
+
+    lock = _RecordingLock()
+    mine(str(source), palace_path=str(palace), file_lock=lock)
+
+    labels = [label for _, label in lock.events]
+    assert labels[0] == OPEN_PHASE
+    assert FINALIZE_PHASE in labels
+    files = {label for label in labels if label.endswith(".md")}
+    assert files == {str(source / f"f{n}.md") for n in range(3)}
+    # Strictly alternating acquire/release is what "never nested, nothing
+    # left held" looks like from outside.
+    assert [kind for kind, _ in lock.events] == ["acquire", "release"] * (len(lock.events) // 2)
+    assert len(lock.events) % 2 == 0

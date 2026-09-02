@@ -70,8 +70,28 @@ filing the same content. The old behavior's 60-second kill was strictly worse �
 it stopped the mine partway with no retry.
 
 Follow a queued hub job in `mempalace_status.mine_queue` or the hub's
-`/statusz`; each completed job also appends a line to `mine_jobs.jsonl` in the
+`/statusz`; every state transition — `accepted`, `started`, `succeeded`,
+`failed`, `interrupted`, `dropped` — appends a line to `mine_jobs.jsonl` in the
 palace directory.
+
+### A hub restart drops queued mines
+
+The hub's queue is in memory. If the hub restarts, whatever it had accepted
+but not yet finished is gone — the CLI has already reported those mines as
+queued, so this is a real loss, and it is made visible rather than fixed:
+
+- the dropped jobs are journalled `dropped` (clean shutdown) and a WARNING
+  names them;
+- a job stopped mid-mine at shutdown ends at a file boundary and is journalled
+  `interrupted` — partially mined, never torn;
+- after a crash or SIGKILL the journal's last line for a job stays `accepted`
+  or `started`. The next hub reads the journal tail at startup, logs a WARNING
+  naming those jobs, and reports them as `mine_queue.lost_previous_run` in
+  `/statusz`; `mempalace doctor` (`capture_liveness`) warns about them too.
+
+Resubmit a lost mine, or wait for the next Stop/SessionEnd hook to re-fire —
+mining is idempotent. A PreCompact-triggered `MEMPAL_DIR` mine may not re-fire
+for a long time, so that one is worth resubmitting by hand.
 
 ## Why hooks do not start the daemon
 

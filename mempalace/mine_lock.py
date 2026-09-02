@@ -51,6 +51,11 @@ class FileLockCursor:
         self._file_lock = file_lock
         self._cm: Optional[ContextManager] = None
         self.current: Optional[str] = None
+        # A lock owner that can go away mid-mine (the hub, on shutdown) hangs
+        # a ``should_stop`` predicate on its factory. Reading it off the
+        # factory keeps three miners' signatures out of it.
+        self._should_stop = getattr(file_lock, "should_stop", None)
+        self.interrupted = False
 
     @property
     def active(self) -> bool:
@@ -75,8 +80,19 @@ class FileLockCursor:
         The hold is *not* released when the iterable is exhausted — the caller
         usually has end-of-mine work to do under the same lock and calls
         :meth:`enter` with :data:`FINALIZE_PHASE`, or :meth:`release`.
+
+        If the lock owner's ``should_stop`` predicate goes true, iteration
+        ends *here*, at a file boundary, with the hold released and
+        :attr:`interrupted` set. The miner then runs its normal end-of-mine
+        block over the files it did finish — a partial mine, not a torn one,
+        and crucially not one still writing after the hub gave back the
+        writer lease.
         """
         for item in files:
+            if self._should_stop is not None and self._should_stop():
+                self.interrupted = True
+                self.release()
+                return
             self.enter(str(item))
             yield item
 
@@ -118,6 +134,15 @@ class GuardedFileLock:
     def __init__(self, factory: Optional[FileLockFactory]) -> None:
         self._factory = factory
         self._active: Optional[ContextManager] = None
+
+    @property
+    def should_stop(self):
+        """Forward the wrapped factory's stop predicate, if it has one.
+
+        ``FileLockCursor`` reads this off whatever object it was handed, and
+        on the hub that object is the wrapper, not the factory underneath.
+        """
+        return getattr(self._factory, "should_stop", None)
 
     def __call__(self, label: str) -> ContextManager:
         return self._track(self._factory(label))

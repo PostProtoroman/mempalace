@@ -184,6 +184,7 @@ def check_capture_liveness(palace_path: str, sessions_root: "str | None" = None)
         mine_transcript = cfg.hooks_mine_transcript
 
         diary_age_hours = _latest_diary_age_hours(palace_path)
+        lost_mines = _lost_mine_jobs(palace_path)
 
         problems = []
         if st["state"] == "BLOCKED":
@@ -211,6 +212,14 @@ def check_capture_liveness(palace_path: str, sessions_root: "str | None" = None)
             warnings_.append(f"last diary checkpoint is {diary_age_hours:.0f}h old")
         elif diary_age_hours is None:
             warnings_.append("no diary checkpoint found yet")
+        if lost_mines:
+            # The hub's mine queue is in memory: a restart drops whatever it
+            # had accepted, after the CLI reported the mine queued. The
+            # journal is the only trace, so surface it here.
+            warnings_.append(
+                f"{len(lost_mines)} hub mine job(s) accepted but never finished "
+                f"(e.g. {lost_mines[0].get('source')}) — a hub restart dropped them"
+            )
 
         if warnings_:
             return _warn(
@@ -222,6 +231,7 @@ def check_capture_liveness(palace_path: str, sessions_root: "str | None" = None)
                 auto_save=auto_save,
                 mine_transcript=mine_transcript,
                 diary_age_hours=diary_age_hours,
+                lost_mine_jobs=len(lost_mines),
             )
 
         return _ok(
@@ -232,9 +242,26 @@ def check_capture_liveness(palace_path: str, sessions_root: "str | None" = None)
             auto_save=auto_save,
             mine_transcript=mine_transcript,
             diary_age_hours=diary_age_hours,
+            lost_mine_jobs=0,
         )
     except Exception as exc:  # pragma: no cover
         return _exc_result(name, exc, "check codex-status / config.json manually")
+
+
+def _lost_mine_jobs(palace_path: str) -> list:
+    """Hub mine jobs the journal accepted but never closed out.
+
+    Best-effort and never fatal: `mempalace doctor` must still run on a palace
+    that was never mined by a hub, where the journal does not exist.
+    """
+    import os
+
+    from .mine_queue import JOURNAL_FILENAME, unfinished_jobs
+
+    try:
+        return unfinished_jobs(os.path.join(os.path.expanduser(palace_path), JOURNAL_FILENAME))
+    except Exception:  # pragma: no cover - diagnostics must not fail the check
+        return []
 
 
 def _latest_diary_age_hours(palace_path: str) -> "float | None":
